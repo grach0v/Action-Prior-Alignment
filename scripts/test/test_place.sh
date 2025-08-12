@@ -2,7 +2,7 @@
 # set -x
 gpu=1
 
-model_path=a2_pretrained/checkpoints/sl_checkpoint_199.pth
+model_path=logs/a2_pretrained/checkpoints/sl_checkpoint_199.pth
 log=a2
 
 echo $model_path
