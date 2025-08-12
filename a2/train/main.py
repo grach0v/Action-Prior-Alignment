@@ -28,6 +28,7 @@ def main():
 
     # Transformer Paras
     parser.add_argument('--fusion_sa', dest='fusion_sa', action='store_true', default=False)
+    parser.add_argument('--efficient_attn', dest='efficient_attn', action='store_true', default=False)
     parser.add_argument('--layer_norm', dest='layer_norm', action='store_true', default=False)
     parser.add_argument('--lang_emb', dest='lang_emb', action='store_true', default=False)
     parser.add_argument('--lang_enc', action='store', type=str, default='clip') 
