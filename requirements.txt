@@ -39,7 +39,7 @@ future==0.18.3
 fvcore==0.1.5.post20221221
 gdown==4.7.1
 grasp-nms==1.0.2
-graspnetAPI==1.2.10
+# graspnetAPI==1.2.10
 h5py==3.10.0
 huggingface-hub==0.17.3
 idna==3.4
@@ -128,9 +128,9 @@ tifffile==2023.9.26
 # timm==0.9.8
 tokenizers==0.14.1
 tomli==2.0.1
-torch==1.10.1+cu113
+torch==1.10.1
 # torchtyping==0.1.4
-torchvision==0.11.2+cu113
+torchvision==0.11.2
 tornado==6.2
 tqdm==4.66.1
 traitlets==5.12.0
