@@ -53,7 +53,10 @@ def parse_args():
     # SAC parameters
     parser.add_argument('--hidden_size', type=int, default=384, metavar='N',
                         help='hidden size (default: 384)')
-    
+    parser.add_argument('--efficient_attention', type=str, default=None,
+                        choices=['linear', 'efficient'],
+                        help='select efficient attention implementation')
+
     args = parser.parse_args()
     return args
 
