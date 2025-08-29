@@ -54,6 +54,11 @@ def main():
     parser.add_argument('--step_size', type=int, default=50, help='step size of learning rate adjustment (default: step scheduler, 50)')
     parser.add_argument('--step_ratio', type=float, default=0.5, help='step ratio of learning rate adjustment (default: 0.5)')
 
+    # Efficient attention option
+    parser.add_argument('--efficient_attention', type=str, default=None,
+                        choices=['linear', 'efficient'],
+                        help='select efficient attention implementation')
+
     args = parser.parse_args()
 
     random.seed(args.seed)
