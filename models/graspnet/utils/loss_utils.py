@@ -47,7 +47,7 @@ def generate_grasp_views(N=300, phi=(np.sqrt(5)-1)/2, center=np.zeros(3), r=1):
                 number of sampled views
             phi: [float]
                 constant for view coordinate calculation, different phi's bring different distributions, default: (sqrt(5)-1)/2
-            center: [np.ndarray, (3,), np.float32]
+            center: [np.ndarray, (3,), float32]
                 sphere center
             r: [float]
                 sphere radius

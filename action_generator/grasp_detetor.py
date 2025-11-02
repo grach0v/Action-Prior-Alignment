@@ -187,4 +187,3 @@ class Graspnet:
 
         return grasp_pose_set, grasp_pose_dict, remain_gg
 
-

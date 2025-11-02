@@ -662,7 +662,7 @@ def rotate(image, angle, is_mask=False):
     return rotated
 
 def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sample_grasp=False, sample_place=False, downsample_interval=10, visualize=False):    
-    pts = torch.from_numpy(pts)
+    pts = torch.from_numpy(pts).to(dtype=torch.float32)
     clip_feats = feat_dict['clip_feats']
     clip_sims = feat_dict['clip_sims'][..., 0]
 
@@ -735,18 +735,25 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
     return sampled_pts, sampled_clip_feats, sampled_clip_sims, grasps, grasp_pose_set, places, place_pose_set
 
 def preprocess_pp_unified(pts, feat_dict, action_set, sample_num, sample_action=False, downsample_interval=10, visualize=False):    
-    pts = torch.from_numpy(pts)
     clip_feats = feat_dict['clip_feats']
     clip_sims = feat_dict['clip_sims'][..., 0]
+    device = clip_feats.device if isinstance(clip_feats, torch.Tensor) else torch.device("cpu")
+
+    clip_sims = torch.as_tensor(clip_sims, device=device, dtype=torch.float32)
+    pts = torch.from_numpy(pts).to(device=device, dtype=torch.float32)
+    if isinstance(clip_feats, torch.Tensor):
+        clip_feats = clip_feats.to(device, dtype=torch.float32)
+    else:
+        clip_feats = torch.as_tensor(clip_feats, device=device, dtype=torch.float32)
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
     sample_indices = torch.argsort(clip_sims, descending=True)[:sample_num]
-    sampled_pts = pts[sample_indices]
-    sampled_clip_feats = clip_feats[sample_indices]
-    sampled_clip_sims = clip_sims[sample_indices][..., None]
-    sampled_pts = sampled_pts.unsqueeze(0).to(dtype=torch.float32) # shape = [1, sample_num, 3]
-    sampled_clip_feats = sampled_clip_feats.unsqueeze(0).to(dtype=torch.float32) # shape = [1, sample_num, feat_dim]
-    sampled_clip_sims = sampled_clip_sims.unsqueeze(0).to(dtype=torch.float32) # shape = [1, sample_num, 1]
+    sampled_pts = torch.index_select(pts, 0, sample_indices)
+    sampled_clip_feats = torch.index_select(clip_feats, 0, sample_indices)
+    sampled_clip_sims = torch.index_select(clip_sims, 0, sample_indices)[..., None]
+    sampled_pts = sampled_pts.unsqueeze(0).to(dtype=torch.float32)  # shape = [1, sample_num, 3]
+    sampled_clip_feats = sampled_clip_feats.unsqueeze(0).to(dtype=torch.float32)  # shape = [1, sample_num, feat_dim]
+    sampled_clip_sims = sampled_clip_sims.unsqueeze(0).to(dtype=torch.float32)  # shape = [1, sample_num, 1]
 
     if visualize:
         # visualization

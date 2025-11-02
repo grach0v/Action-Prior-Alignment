@@ -220,3 +220,7 @@ assets
 testing_cases
 *.zip
 data
+
+*.png
+logs/
+tensorlogs/

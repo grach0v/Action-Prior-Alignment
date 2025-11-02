@@ -35,16 +35,10 @@ Install packages via Pip.
 ```bash
 pip install -r requirements.txt
 ```
-Compile and install pointnet2 operators. (Code adapted from [votenet](https://github.com/facebookresearch/votenet))
-```bash
-cd pointnet2
-python setup.py install
-```
-Compile and install knn operator. (Code adapted from [pytorch_knn_cuda](https://github.com/chrischoy/pytorch_knn_cuda))
-```bash
-cd knn
-python setup.py install
-```
+The pointnet2 and knn CUDA extensions are compiled automatically at runtime the first
+time they are imported (via `torch.utils.cpp_extension.load`), so no manual build step is required.
+Ensure that you have a C++17 toolchain, `ninja`, and a CUDA toolkit compatible with your PyTorch
+installation available before running the code.
 Install graspnetAPI for evaluation.
 ```bash
 git clone https://github.com/graspnet/graspnetAPI.git

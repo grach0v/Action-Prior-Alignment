@@ -27,15 +27,18 @@ conda create -n a2 python=3.8
 conda activate a2
 
 pip install -r requirements.txt
-
-python setup.py develop
-
-cd models/graspnet/pointnet2
-python setup.py install
-
-cd ../knn
-python setup.py install
+pip install -e . --no-deps
 ```
+For an exact replica of the development environment, install from the frozen snapshot:
+
+```
+pip install -r requirements-freeze.txt
+pip install -e . --no-deps
+```
+
+The first import of the custom KNN or PointNet++ operators triggers a JIT build via
+`torch.utils.cpp_extension.load`. Make sure a C++17 toolchain, `ninja`, and a CUDA
+toolkit version that matches your PyTorch build are available on the machine.
 
 ###  Potential Issues of Installation
 - When installing graspnetAPI, the following problem might occur:
@@ -56,6 +59,10 @@ RuntimeError: CUDA error: no kernel image is available for execution on the devi
 ```
 solution: to install torch with the right cuda version
 
+- If the on-demand extension build fails with `cuda_runtime_api.h: No such file or directory`,
+  install the NVIDIA CUDA toolkit that matches your PyTorch/cuDNN build and ensure its headers
+  are discoverable (e.g., set `CUDA_HOME`).
+
 ###  Easy Installation
 
 If you use conda, we provide our conda environment produced by ```conda-pack``` in this [link](https://huggingface.co/datasets/KechunXu1/A2_Dataset/blob/main/vilg3d.tar.gz). NOTE: This environment is compatiable with CUDA 11.3.
@@ -67,13 +74,8 @@ mkdir a2
 tar -xzvf a2.tar.gz -C a2
 conda activate a2
 
-python setup.py develop
-
-cd models/graspnet/pointnet2
-python setup.py install
-
-cd ../knn
-python setup.py install
+pip install -r requirements.txt
+pip install -e . --no-deps
 ```
 
 ### Assets
