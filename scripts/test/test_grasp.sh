@@ -2,7 +2,8 @@
 # set -x
 gpu=0
 
-model_path=a2_pretrained/checkpoints/sl_checkpoint_199.pth
+# model_path=a2_pretrained/checkpoints/sl_checkpoint_199.pth
+model_path=logs/2025-11-02-22-57-28-train-a2/checkpoints/sl_checkpoint_2025-11-03_00-02-09_199.pth
 log=a2
 
 echo $model_path

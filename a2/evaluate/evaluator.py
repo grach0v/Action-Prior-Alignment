@@ -7,6 +7,7 @@ import torch
 import shutil
 import open3d as o3d
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 import utils.utils as utils
 from env.constants import WORKSPACE_LIMITS, GRASP_WORKSPACE_LIMITS, PLACE_WORKSPACE_LIMITS, PP_WORKSPACE_LIMITS, PP_PIXEL_SIZE, WORKSPACE_LIMITS, PP_SHIFT_Y
@@ -32,6 +33,7 @@ class BaseEvaluator:
         # Initialize components
         self.init_environment()
         self.init_logger()
+        self.persist_model_metadata()
         self.init_networks()
         self.init_feature_fields()
         
@@ -94,6 +96,29 @@ class BaseEvaluator:
                 self.process_episode(episode, f)
                 
             self.case += 1 
+
+    def persist_model_metadata(self):
+        """Copy training config and record checkpoint path for reproducibility."""
+        model_path = getattr(self.args, "model_path", None)
+        if not model_path:
+            return
+
+        model_path = Path(model_path)
+        if not model_path.exists():
+            return
+
+        dest_dir = Path(self.logger.base_directory)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Add a plain-text record of which checkpoint was evaluated.
+        checkpoint_record = dest_dir / "used_model_checkpoint.txt"
+        checkpoint_record.write_text(str(model_path.resolve()))
+
+        # Copy the originating training config when it is available.
+        train_log_dir = model_path.parent.parent
+        config_path = train_log_dir / "config.txt"
+        if config_path.exists():
+            shutil.copyfile(config_path, dest_dir / "used_model_config.txt")
 
 class PickEvaluator(BaseEvaluator):
     def __init__(self, args):
