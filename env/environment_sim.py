@@ -495,7 +495,8 @@ class Environment:
         return color, depth, segm
 
     def __del__(self):
-        pb.disconnect()
+        if self.gui:
+            pb.disconnect()
 
     def get_link_pose(self, body, link):
         result = pb.getLinkState(body, link)
