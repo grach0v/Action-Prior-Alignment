@@ -3,7 +3,10 @@
 gpu=0
 
 # model_path=a2_pretrained/checkpoints/sl_checkpoint_199.pth
-model_path=logs/2025-11-02-22-57-28-train-a2/checkpoints/sl_checkpoint_2025-11-03_00-02-09_199.pth
+# model_path=logs/2025-11-02-22-57-28-train-a2/checkpoints/sl_checkpoint_2025-11-03_00-02-09_199.pth
+# model_path=logs/2025-07-20-17-52-02-train-a2/checkpoints/sl_checkpoint_2025-07-20_23-01-50_199.pth
+model_path=logs/2025-11-03-21-47-30-train-a2/checkpoints/sl_checkpoint_2025-11-03_22-43-56_199.pth
+
 log=a2
 
 echo $model_path
