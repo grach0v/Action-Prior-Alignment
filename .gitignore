@@ -224,3 +224,4 @@ data
 *.png
 logs/
 tensorlogs/
+resuls

@@ -1,0 +1,11 @@
+python scripts/run_optuna_experiments.py \
+  --train-path data/a2_pp_data_train.npy \
+  --test-path data/a2_pp_data_test.npy \
+  --n-trials 100 \
+  --epochs-per-trial 20 \
+  --study-name efficient_attn_sweep \
+  --storage results/efficient_attn_sweep.db \
+  --csv-output results/efficient_attn_sweep.csv \
+  --device cuda \
+  --progress \
+  --prune

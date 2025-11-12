@@ -7,6 +7,10 @@ from helpers.logger import Logger
 from a2.train.trainer import Trainer
 from helpers.data_loader import unified_data_loader, unified_adaptive_data_loader
 from models.networks import CLIPAction, AdaptPolicyCLIPAction, AdaptFeatCLIPAction, CLIPLangEmbAction
+from models.efficient_attention import (
+    list_efficient_attention_choices,
+    normalize_efficient_attention_choice,
+)
 from tensorboardX import SummaryWriter
 
 def main():
@@ -38,6 +42,13 @@ def main():
     parser.add_argument('--heads', type=int, default=8)
     parser.add_argument('--hidden_size', type=int, default=384, metavar='N',
                         help='hidden size (default: 384)')
+    parser.add_argument(
+        '--efficient_attn',
+        type=str,
+        default='none',
+        choices=list_efficient_attention_choices(),
+        help='Swap the standard MultiheadAttention with an efficient variant.',
+    )
 
     # Training Paras
     parser.add_argument('--use_rope', dest='use_rope', action='store_true', default=False)
@@ -55,6 +66,7 @@ def main():
     parser.add_argument('--step_ratio', type=float, default=0.5, help='step ratio of learning rate adjustment (default: 0.5)')
 
     args = parser.parse_args()
+    args.efficient_attn = normalize_efficient_attention_choice(args.efficient_attn)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
