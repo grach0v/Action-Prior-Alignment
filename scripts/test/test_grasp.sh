@@ -1,9 +1,9 @@
 #!/bin/bash
 # set -x
-gpu=0
+gpu=7
 
-model_path=a2_pretrained/checkpoints/sl_checkpoint_199.pth
-log=a2
+model_path=logs/2025-11-24-06-18-29-train-a2_default/checkpoints/sl_checkpoint_2025-11-24_13-56-57_199.pth
+log=a2_my_trained_default
 
 echo $model_path
 echo seen
