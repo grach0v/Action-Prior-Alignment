@@ -34,10 +34,12 @@ def parse_args():
     # Transformer paras
     parser.add_argument('--ratio', action='store', type=float, default=0.2)
     parser.add_argument('--feat_backbone', action='store', type=str, default='clip')
-    parser.add_argument('--fusion_sa', dest='fusion_sa', action='store_true', default=False) 
-    parser.add_argument('--layer_norm', dest='layer_norm', action='store_true', default=False) 
+    parser.add_argument('--fusion_sa', dest='fusion_sa', action='store_true', default=False)    
+    parser.add_argument('--layer_norm', dest='layer_norm', action='store_true', default=False)
     parser.add_argument('--lang_emb', dest='lang_emb', action='store_true', default=False)
     parser.add_argument('--lang_enc', action='store', type=str, default='longclip')
+    parser.add_argument('-efficient_attn', '--efficient_attn', action='store', type=str, default=None,
+                        help='use efficient attention implementation (see models/efficient_attention.py)')
     parser.add_argument('--use_rope', dest='use_rope', action='store_true', default=False)
     parser.add_argument('--no_feat_rope', dest='no_feat_rope', action='store_true', default=False)
     parser.add_argument('--no_rgb_feat', dest='no_rgb_feat', action='store_true', default=False)

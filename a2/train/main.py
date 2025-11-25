@@ -1,4 +1,5 @@
 import datetime
+import os
 import random
 import argparse
 import numpy as np
@@ -32,6 +33,8 @@ def main():
     parser.add_argument('--lang_emb', dest='lang_emb', action='store_true', default=False)
     parser.add_argument('--lang_enc', action='store', type=str, default='clip') 
     parser.add_argument('--task_emb', dest='task_emb', action='store_true', default=False)
+    parser.add_argument('-efficient_attn', '--efficient_attn', action='store', type=str, default=None,
+                        help='use efficient attention implementation (see models/efficient_attention.py)')
     parser.add_argument('--agent', action='store', type=str, default='unified')
     parser.add_argument('--width', type=int, default=768)
     parser.add_argument('--layers', type=int, default=1) # cross attention layer

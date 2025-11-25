@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .clip import clip, tokenize
+from .efficient_attention import build_attention_module, normalize_efficient_attention_choice
 
 class Adapter(nn.Module):
     def __init__(self, c_in, reduction=4):
@@ -217,10 +218,12 @@ class QuickGELU(nn.Module):
 
 # Self Attention
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, efficient_attn: str = None):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.efficient_attn = normalize_efficient_attention_choice(efficient_attn)
+        self.use_efficient_attn = self.efficient_attn is not None
+        self.attn = build_attention_module(self.efficient_attn, d_model, n_head) if self.use_efficient_attn else nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -231,22 +234,30 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        if self.use_efficient_attn:
+            attn_out, _ = self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)
+            return attn_out
+        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
 
     def forward_v(self, x: torch.Tensor):
         """
         Forward function for computing the value features for dense prediction (i.e., features for every image patch).
         """
-        # Get the weights and biases for the value projection, multihead attention uses 3 * embed_dim for the input projection
-        v_in_proj_weight = self.attn.in_proj_weight[-self.attn.embed_dim:]
-        v_in_proj_bias = self.attn.in_proj_bias[-self.attn.embed_dim:]
+        if not self.use_efficient_attn:
+            v_in_proj_weight = self.attn.in_proj_weight[-self.attn.embed_dim:]
+            v_in_proj_bias = self.attn.in_proj_bias[-self.attn.embed_dim:]
+            v_in = F.linear(self.ln_1(x), v_in_proj_weight, v_in_proj_bias)
+            v_out = F.linear(v_in, self.attn.out_proj.weight, self.attn.out_proj.bias)
+            return v_out
 
-        v_in = F.linear(self.ln_1(x), v_in_proj_weight, v_in_proj_bias)
-        v_out = F.linear(v_in, self.attn.out_proj.weight, self.attn.out_proj.bias)
+        if hasattr(self.attn, "v_proj"):
+            v_in = self.attn.v_proj(self.ln_1(x))
+            if hasattr(self.attn, "out_proj"):
+                return self.attn.out_proj(v_in)
+            return v_in
 
-        # Using the value features works the best. Adding this to 'x' or feeding 'v' to the LayerNorm then MLP degrades the performance
-        return v_out
+        raise NotImplementedError("forward_v is not supported for the selected efficient attention.")
 
 
     def forward(self, x: torch.Tensor):
@@ -255,21 +266,21 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, efficient_attn: str = None):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, efficient_attn) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
 # Cross Attention
 class CrossResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int):
+    def __init__(self, d_model: int, n_head: int, efficient_attn: str = None):
         super().__init__()
 
-        self.attn = CrossModalAttention(embed_dim=d_model, num_heads=n_head, output_dim=d_model)
+        self.attn = CrossModalAttention(embed_dim=d_model, num_heads=n_head, output_dim=d_model, efficient_attn=efficient_attn)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -291,11 +302,11 @@ class CrossResidualAttentionBlock(nn.Module):
 
 # multi layer
 class CrossTransformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int):
+    def __init__(self, width: int, layers: int, heads: int, efficient_attn: str = None):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.ModuleList([CrossResidualAttentionBlock(width, heads) for _ in range(layers)])
+        self.resblocks = nn.ModuleList([CrossResidualAttentionBlock(width, heads, efficient_attn) for _ in range(layers)])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: torch.Tensor = None):
         for i, _ in enumerate(self.resblocks):
@@ -308,7 +319,7 @@ class CrossTransformer(nn.Module):
 class CrossModalAttention(nn.Module):
     """ Cross-Modal Attention. Adapted from: https://github.com/openai/CLIP/blob/main/clip/model.py#L56 """
 
-    def __init__(self, embed_dim=1024, num_heads=32, output_dim=1024):
+    def __init__(self, embed_dim=1024, num_heads=32, output_dim=1024, efficient_attn: str = None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -316,8 +327,18 @@ class CrossModalAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.c_proj = nn.Linear(embed_dim, output_dim)
+        self.efficient_attn = normalize_efficient_attention_choice(efficient_attn)
+        self.use_efficient_attn = self.efficient_attn is not None
+        if self.use_efficient_attn:
+            self.attn = build_attention_module(self.efficient_attn, embed_dim, num_heads)
+        else:
+            self.attn = None
 
     def forward(self, q, k, v, attn_mask=None):
+        if self.use_efficient_attn:
+            x, attn_weights = self.attn(q, k, v, attn_mask=attn_mask, need_weights=True)
+            return x, attn_weights
+
         x, attn_weights = F.multi_head_attention_forward(
             query=q, key=k, value=v,
             embed_dim_to_check=v.shape[-1],
@@ -342,17 +363,17 @@ class CrossModalAttention(nn.Module):
 
 # A unified network architecture for grasp and place
 class CLIPActionFusion(nn.Module):
-    def __init__(self, action_dim, width, layers, heads, device, task_num=None, use_rope=False, no_feat_rope=False, sa=False, no_rgb_feat=False):
+    def __init__(self, action_dim, width, layers, heads, device, task_num=None, use_rope=False, no_feat_rope=False, sa=False, no_rgb_feat=False, efficient_attn: str = None):
         super().__init__()
         
         self.device = device
         
         # cross attention
-        self.cross_attn = CrossTransformer(width=width, layers=layers, heads=heads)
+        self.cross_attn = CrossTransformer(width=width, layers=layers, heads=heads, efficient_attn=efficient_attn)
 
         self.sa = sa
         if self.sa:
-            self.fusion_attn = Transformer(width=width, layers=layers*2, heads=heads)
+            self.fusion_attn = Transformer(width=width, layers=layers*2, heads=heads, efficient_attn=efficient_attn)
         
         hidden_dim = int(width / 2)
         # hidden_dim = 256 
@@ -448,14 +469,14 @@ class CLIPActionFusion(nn.Module):
 
 # A unified network architecture for grasp and place
 class CLIPActionLangFusion(nn.Module):
-    def __init__(self, action_dim, width, layers, heads, lang_enc, device, task_num=None, use_rope=False):
+    def __init__(self, action_dim, width, layers, heads, lang_enc, device, task_num=None, use_rope=False, efficient_attn: str = None):
         super().__init__()
         
         self.device = device
         
         # cross attention
-        self.lang_cross_attn = CrossTransformer(width=width, layers=layers, heads=heads)
-        self.cross_attn = CrossTransformer(width=width, layers=layers, heads=heads)
+        self.lang_cross_attn = CrossTransformer(width=width, layers=layers, heads=heads, efficient_attn=efficient_attn)
+        self.cross_attn = CrossTransformer(width=width, layers=layers, heads=heads, efficient_attn=efficient_attn)
         
         hidden_dim = int(width / 2)
         # hidden_dim = 256 
@@ -586,7 +607,19 @@ class CLIPAction(nn.Module):
     def __init__(self, action_dim, args):
         super().__init__()
         self.device = args.device
-        self.vilg_fusion = CLIPActionFusion(action_dim, args.width, args.layers, args.heads, self.device, args.task_num, args.use_rope, args.no_feat_rope, args.fusion_sa, args.no_rgb_feat).to(device=self.device)
+        self.vilg_fusion = CLIPActionFusion(
+            action_dim,
+            args.width,
+            args.layers,
+            args.heads,
+            self.device,
+            args.task_num,
+            args.use_rope,
+            args.no_feat_rope,
+            args.fusion_sa,
+            args.no_rgb_feat,
+            args.efficient_attn,
+        ).to(device=self.device)
         self.policy = Policy(args.width, args.hidden_size, args.layer_norm).to(self.device)
 
     def forward(self, pts_pos, pts_feat, pts_sim, actions, mode=None):
@@ -604,7 +637,17 @@ class CLIPLangEmbAction(nn.Module):
     def __init__(self, action_dim, args):
         super().__init__()
         self.device = args.device
-        self.vilg_fusion = CLIPActionLangFusion(action_dim, args.width, args.layers, args.heads, args.lang_enc, self.device, args.task_num, args.use_rope).to(device=self.device)
+        self.vilg_fusion = CLIPActionLangFusion(
+            action_dim,
+            args.width,
+            args.layers,
+            args.heads,
+            args.lang_enc,
+            self.device,
+            args.task_num,
+            args.use_rope,
+            args.efficient_attn,
+        ).to(device=self.device)
         self.policy = Policy(args.width, args.hidden_size).to(self.device)
 
     def forward(self, pts_pos, pts_feat, actions, lang_goal, mode=None):
@@ -622,7 +665,19 @@ class AdaptPolicyCLIPAction(nn.Module):
     def __init__(self, action_dim, args):
         super().__init__()
         self.device = args.device
-        self.vilg_fusion = CLIPActionFusion(action_dim, args.width, args.layers, args.heads, self.device, args.task_num, args.use_rope, args.fusion_sa).to(device=self.device)
+        self.vilg_fusion = CLIPActionFusion(
+            action_dim,
+            args.width,
+            args.layers,
+            args.heads,
+            self.device,
+            args.task_num,
+            args.use_rope,
+            args.no_feat_rope,
+            args.fusion_sa,
+            args.no_rgb_feat,
+            args.efficient_attn,
+        ).to(device=self.device)
         self.policy = Policy(args.width, args.hidden_size).to(self.device)
         self.residual_policy = Policy(args.width, args.hidden_size).to(self.device)
 
@@ -645,7 +700,19 @@ class AdaptFeatCLIPAction(nn.Module):
     def __init__(self, action_dim, args):
         super().__init__()
         self.device = args.device
-        self.vilg_fusion = CLIPActionFusion(action_dim, args.width, args.layers, args.heads, self.device, args.task_num, args.use_rope, args.fusion_sa).to(device=self.device)
+        self.vilg_fusion = CLIPActionFusion(
+            action_dim,
+            args.width,
+            args.layers,
+            args.heads,
+            self.device,
+            args.task_num,
+            args.use_rope,
+            args.no_feat_rope,
+            args.fusion_sa,
+            args.no_rgb_feat,
+            args.efficient_attn,
+        ).to(device=self.device)
         self.feat_adapter = Adapter(args.width).to(device=self.device)
         self.policy = Policy(args.width, args.hidden_size).to(self.device)
 
