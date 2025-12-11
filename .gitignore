@@ -227,3 +227,6 @@ testing_cases
 mask_bboxs.png
 place_mask_map.png
 place_valid_mask.png
+
+.cuda-nvcc
+bin

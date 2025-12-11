@@ -3,21 +3,47 @@
     Modified by Minghao Gou
 """
 
+"""
+GraspNet baseline wrapper that bridges the project to the upgraded
+`GraspNet-PointNet2-Pytorch-General-Upgrade` codebase.
+
+The upgraded repo lives in `models/GraspNet-PointNet2-Pytorch-General-Upgrade`
+and supports modern Python/Torch/CUDA.  We add its submodules to `sys.path`
+and reuse its network / collision utilities, while keeping the public API of
+`GraspNetBaseLine` intact for the rest of the project.
+"""
+
 import os
 import sys
+from pathlib import Path
 import numpy as np
 import open3d as o3d
-import importlib
-import scipy.io as scio
-from PIL import Image
+
+# compatibility shim for older deps expecting np.float
+if not hasattr(np, "float"):
+    np.float = float  # type: ignore[attr-defined]
 
 import torch
 from graspnetAPI import GraspGroup
 
-from .models.graspnet import GraspNet, pred_decode
-from .dataset.graspnet_dataset import GraspNetDataset
-from .utils.collision_detector import ModelFreeCollisionDetector
-from .utils.data_utils import CameraInfo, create_point_cloud_from_depth_image
+# ---------------------------------------------------------------------------
+# Wire up the upgraded GraspNet implementation.
+# ---------------------------------------------------------------------------
+THIS_DIR = Path(__file__).resolve().parent
+UPGRADED_ROOT = THIS_DIR.parent / "GraspNet-PointNet2-Pytorch-General-Upgrade"
+sys.path.extend(
+    [
+        str(UPGRADED_ROOT),
+        str(UPGRADED_ROOT / "models"),
+        str(UPGRADED_ROOT / "dataset"),
+        str(UPGRADED_ROOT / "utils"),
+    ]
+)
+
+from graspnet import GraspNet, pred_decode  # type: ignore  # noqa: E402
+from graspnet_dataset import GraspNetDataset  # type: ignore  # noqa: E402
+from collision_detector import ModelFreeCollisionDetector  # type: ignore  # noqa: E402
+from data_utils import CameraInfo, create_point_cloud_from_depth_image  # type: ignore  # noqa: E402
 
 class GraspNetBaseLine():
     def __init__(self, checkpoint_path, num_point = 20000, num_view = 300, collision_thresh = 0.001, empty_thresh = 0.15, voxel_size = 0.01):
@@ -36,7 +62,7 @@ class GraspNetBaseLine():
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         net.to(device)
         # Load checkpoint
-        checkpoint = torch.load(self.checkpoint_path)
+        checkpoint = torch.load(self.checkpoint_path, map_location=device)
         net.load_state_dict(checkpoint['model_state_dict'])
         start_epoch = checkpoint['epoch']
         print("-> loaded checkpoint %s (epoch: %d)"%(self.checkpoint_path, start_epoch))

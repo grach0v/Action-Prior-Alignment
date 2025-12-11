@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 import numpy as np
 import pybullet as p
 import cv2
@@ -27,7 +28,10 @@ reconstruction_config = {
 }
 
 graspnet_config = {
-    'graspnet_checkpoint_path': 'models/graspnet/logs/log_rs/checkpoint.tar',
+    # Resolved at runtime to stay robust to where the script is launched.
+    'graspnet_checkpoint_path': str(
+        (Path(__file__).resolve().parent.parent / 'models' / 'graspnet' / 'logs' / 'log_rs' / 'checkpoint.tar')
+    ),
     'refine_approach_dist': 0.01,
     'dist_thresh': 0.05,
     'angle_thresh': 15,
@@ -671,9 +675,9 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
     sampled_pts = pts[sample_indices]
     sampled_clip_feats = clip_feats[sample_indices]
     sampled_clip_sims = clip_sims[sample_indices][..., None]
-    sampled_pts = sampled_pts.unsqueeze(0).to(dtype=torch.float32) # shape = [1, sample_num, 3]
-    sampled_clip_feats = sampled_clip_feats.unsqueeze(0).to(dtype=torch.float32) # shape = [1, sample_num, feat_dim]
-    sampled_clip_sims = sampled_clip_sims.unsqueeze(0).to(dtype=torch.float32) # shape = [1, sample_num, 1]
+    sampled_pts = sampled_pts.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, sample_num, 3]
+    sampled_clip_feats = sampled_clip_feats.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, sample_num, feat_dim]
+    sampled_clip_sims = sampled_clip_sims.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, sample_num, 1]
 
     if visualize:
         # visualization
@@ -698,13 +702,13 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
 
     grasps = None
     for grasp in grasp_pose_set:  
-        grasp = torch.from_numpy(grasp)
+        grasp = torch.from_numpy(grasp).to(device)
         grasp = grasp.unsqueeze(0)
         if grasps == None:
             grasps = grasp
         else:
             grasps = torch.cat((grasps, grasp), dim=0) # shape = [n_grasp, grasp_dim]
-    grasps = grasps.unsqueeze(0).to(dtype=torch.float32) # shape = [1, n_grasp, grasp_dim]
+    grasps = grasps.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, n_grasp, grasp_dim]
 
     if sample_grasp:
         pos_grasps = grasps[..., :3][0].unsqueeze(1)
@@ -716,13 +720,13 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
         
     places = None
     for place in place_pose_set:
-        place = torch.from_numpy(place)
+        place = torch.from_numpy(place).to(device)
         place = place.unsqueeze(0)
         if places == None:
             places = place
         else:
             places = torch.cat((places, place), dim=0) # shape = [n_place, place_dim]
-    places = places.unsqueeze(0).to(dtype=torch.float32) # shape = [1, n_place, place_dim]
+    places = places.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, n_place, place_dim]
     
     if sample_place:
         pos_places = places[..., :3][0].unsqueeze(1)
@@ -735,9 +739,10 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
     return sampled_pts, sampled_clip_feats, sampled_clip_sims, grasps, grasp_pose_set, places, place_pose_set
 
 def preprocess_pp_unified(pts, feat_dict, action_set, sample_num, sample_action=False, downsample_interval=10, visualize=False):    
-    pts = torch.from_numpy(pts)
     clip_feats = feat_dict['clip_feats']
-    clip_sims = feat_dict['clip_sims'][..., 0]
+    device = clip_feats.device
+    clip_sims = feat_dict['clip_sims'][..., 0].to(device)
+    pts = torch.from_numpy(pts).to(device)
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
     sample_indices = torch.argsort(clip_sims, descending=True)[:sample_num]
