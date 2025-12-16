@@ -12,29 +12,57 @@ We study the task of language-conditioned pick and place in clutter, where a rob
 Any question, please let me know: kcxu@zju.edu.cn
 
 ## Setup
-###  Installation
-
-- Ubuntu 20.04
-- Torch 1.10.1
-- Cuda 11.3
-- GTX 4090 is tested
+###  Installation (recommended, uv)
+- Ubuntu 20.04+
+- Python 3.10/3.11
+- CUDA toolkit matching your GPU/driver (we tested CUDA 12.8 on RTX 5090)
 
 ```
 git clone git@github.com:xukechun/Action-Prior-Alignment.git
 cd Action-Prior-Alignment
 
-conda create -n a2 python=3.8
-conda activate a2
+# fetch the upgraded GraspNet baseline used by this project
+cd models
+git clone git@github.com:H-Freax/GraspNet_Pointnet2_PyTorch1.13.1.git
+cd ..
 
-pip install -r requirements.txt
+# create env
+uv venv --python 3.11 .venv
+source .venv/bin/activate
 
-python setup.py develop
+# install torch nightly for your CUDA (example for CUDA 12.8)
+uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 
-cd models/graspnet/pointnet2
+# project deps
+uv pip install -r requirements.txt
+uv pip install -e .
+
+# build the GraspNet custom ops (requires nvcc matching your torch CUDA)
+export CUDA_HOME=/path/to/your/cuda           # e.g. /usr/local/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+cd models/GraspNet_Pointnet2_PyTorch1.13.1/pointnet2
 python setup.py install
 
 cd ../knn
 python setup.py install
+cd ../../..
+```
+
+###  Installation (legacy conda)
+If you prefer conda (CUDA 11.3 / PyTorch 1.10.1 as in the original paper):
+```
+git clone git@github.com:xukechun/Action-Prior-Alignment.git
+cd Action-Prior-Alignment
+cd models && git clone git@github.com:H-Freax/GraspNet_Pointnet2_PyTorch1.13.1.git && cd ..
+
+conda create -n a2 python=3.8
+conda activate a2
+pip install -r requirements.txt
+python setup.py develop
+cd models/GraspNet_Pointnet2_PyTorch1.13.1/pointnet2 && python setup.py install
+cd ../knn && python setup.py install
 ```
 
 ###  Potential Issues of Installation
