@@ -160,14 +160,16 @@ class Logger:
     def load_sl_checkpoint(self, model, ckpt_path, evaluate=False):
         print('Loading models from {}'.format(ckpt_path))
         if ckpt_path is not None:
-            checkpoint = torch.load(ckpt_path)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            checkpoint = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(checkpoint)
             model.eval() if evaluate else model.train()
             
     def load_base_sl_checkpoint(self, model, ckpt_path, evaluate=False):
         print('Loading base models from {}'.format(ckpt_path))
         if ckpt_path is not None:
-            checkpoint_dict = torch.load(ckpt_path)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            checkpoint_dict = torch.load(ckpt_path, map_location=device)
             model_dict = model.state_dict()
             model_dict.update(checkpoint_dict)
             model.load_state_dict(model_dict)

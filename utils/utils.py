@@ -30,7 +30,7 @@ reconstruction_config = {
 graspnet_config = {
     # Resolved at runtime to stay robust to where the script is launched.
     'graspnet_checkpoint_path': str(
-        (Path(__file__).resolve().parent.parent / 'models' / 'graspnet' / 'logs' / 'log_rs' / 'checkpoint.tar')
+        (Path(__file__).resolve().parent.parent / 'models' / 'graspnet_new' / 'logs' / 'log_rs' / 'checkpoint.tar')
     ),
     'refine_approach_dist': 0.01,
     'dist_thresh': 0.05,

@@ -4,7 +4,7 @@ import open3d_plus as o3dp
 from scipy.spatial.transform import Rotation as R
 import copy
 
-from models.graspnet.graspnet_baseline import GraspNetBaseLine
+from models.graspnet_new.graspnet_baseline import GraspNetBaseLine
 from utils.utils import graspnet_config
 from graspnetAPI import GraspGroup
 
@@ -186,5 +186,4 @@ class Graspnet:
                 o3d.visualization.draw_geometries([frame, full_pcd, *nms_gg.to_open3d_geometry_list()])
 
         return grasp_pose_set, grasp_pose_dict, remain_gg
-
 

@@ -230,3 +230,5 @@ place_valid_mask.png
 
 .cuda-nvcc
 bin
+
+models/graspnet_new

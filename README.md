@@ -12,56 +12,46 @@ We study the task of language-conditioned pick and place in clutter, where a rob
 Any question, please let me know: kcxu@zju.edu.cn
 
 ## Setup
-###  Installation (recommended, uv)
-- Ubuntu 20.04+
-- Python 3.10/3.11
-- CUDA toolkit matching your GPU/driver (we tested CUDA 12.8 on RTX 5090)
+###  Installation (uv, Python 3.10/3.11)
+- Ubuntu 20.04+, uv installed, CUDA toolkit that matches your GPU/driver (we tested CUDA 12.4).
+- The upgraded GraspNet baseline now lives in `models/graspnet_new` (renamed from `GraspNet_Pointnet2_PyTorch1.13.1`).
 
 ```
 git clone git@github.com:xukechun/Action-Prior-Alignment.git
 cd Action-Prior-Alignment
 
-# fetch the upgraded GraspNet baseline used by this project
-cd models
-git clone git@github.com:H-Freax/GraspNet_Pointnet2_PyTorch1.13.1.git
-cd ..
-
-# create env
+# create the virtualenv with uv (pick 3.10 or 3.11)
 uv venv --python 3.11 .venv
 source .venv/bin/activate
 
-# install torch nightly for your CUDA (example for CUDA 12.8)
-uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+# install torch that matches your CUDA (example for CUDA 12.4)
+uv pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
 
-# project deps
+# project deps + editable install
 uv pip install -r requirements.txt
 uv pip install -e .
 
 # build the GraspNet custom ops (requires nvcc matching your torch CUDA)
-export CUDA_HOME=/path/to/your/cuda           # e.g. /usr/local/cuda-12.8
+export CUDA_HOME=/usr/local/cuda-12.4           # adjust to your CUDA install
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
-cd models/GraspNet_Pointnet2_PyTorch1.13.1/pointnet2
-python setup.py install
-
-cd ../knn
-python setup.py install
-cd ../../..
+uv run python models/graspnet_new/pointnet2/setup.py install
+uv run python models/graspnet_new/knn/setup.py install
 ```
+- The GraspNet PointNet2 ops are CUDA-only; make sure a CUDA-capable GPU/driver is visible when running tests or training.
 
 ###  Installation (legacy conda)
 If you prefer conda (CUDA 11.3 / PyTorch 1.10.1 as in the original paper):
 ```
 git clone git@github.com:xukechun/Action-Prior-Alignment.git
 cd Action-Prior-Alignment
-cd models && git clone git@github.com:H-Freax/GraspNet_Pointnet2_PyTorch1.13.1.git && cd ..
 
 conda create -n a2 python=3.8
 conda activate a2
 pip install -r requirements.txt
 python setup.py develop
-cd models/GraspNet_Pointnet2_PyTorch1.13.1/pointnet2 && python setup.py install
+cd models/graspnet_new/pointnet2 && python setup.py install
 cd ../knn && python setup.py install
 ```
 
@@ -82,7 +72,7 @@ export SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True
 ```
 RuntimeError: CUDA error: no kernel image is available for execution on the device
 ```
-solution: to install torch with the right cuda version
+solution: install torch with the right CUDA wheels (e.g., replace the `cu124` index URL above if you use a different toolkit).
 
 ###  Easy Installation
 
@@ -97,7 +87,7 @@ conda activate a2
 
 python setup.py develop
 
-cd models/graspnet/pointnet2
+cd models/graspnet_new/pointnet2
 python setup.py install
 
 cd ../knn
