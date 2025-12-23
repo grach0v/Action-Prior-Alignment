@@ -232,3 +232,4 @@ place_valid_mask.png
 bin
 
 models/graspnet_new
+models/graspnet_new_old*

@@ -13,12 +13,16 @@ Any question, please let me know: kcxu@zju.edu.cn
 
 ## Setup
 ###  Installation (uv, Python 3.10/3.11)
+Prereqs:
 - Ubuntu 20.04+, uv installed, CUDA toolkit that matches your GPU/driver (we tested CUDA 12.4).
-- The upgraded GraspNet baseline now lives in `models/graspnet_new` (renamed from `GraspNet_Pointnet2_PyTorch1.13.1`).
+- The upgraded GraspNet baseline is **not** tracked in this repo (`models/graspnet_new` is gitignored), so you must clone it yourself.
 
 ```
 git clone git@github.com:xukechun/Action-Prior-Alignment.git
 cd Action-Prior-Alignment
+
+# clone the upgraded GraspNet baseline into the expected path
+git clone https://github.com/H-Freax/GraspNet-PointNet2-Pytorch-General-Upgrade.git models/graspnet_new
 
 # create the virtualenv with uv (pick 3.10 or 3.11)
 uv venv --python 3.11 .venv
@@ -35,10 +39,22 @@ uv pip install -e .
 export CUDA_HOME=/usr/local/cuda-12.4           # adjust to your CUDA install
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+export TORCH_CUDA_ARCH_LIST="8.0+PTX"           # A100 = 8.0; adjust for your GPU
+export FORCE_CUDA=1
 
-uv run python models/graspnet_new/pointnet2/setup.py install
-uv run python models/graspnet_new/knn/setup.py install
+cd models/graspnet_new/pointnet2
+uv run python setup.py install
+cd ../knn
+uv run python setup.py install
+cd ../../..
 ```
+- Download the GraspNet pretrained weights (`checkpoint-rs.tar`) and place it at `models/graspnet_new/checkpoint-rs.tar` (or update `utils/utils.py` to point elsewhere).
+  - Example download with uv + gdown:
+    ```
+    uv pip install gdown
+    uv run python -m gdown "https://drive.google.com/uc?id=1hd0G8LN6tRpi4742XOTEisbTXNZ-1jmk" -O models/graspnet_new/checkpoint-rs.tar
+    ```
+- Use `uv run` for any manual Python commands to ensure the local packages (like `helpers/`) resolve correctly.
 - The GraspNet PointNet2 ops are CUDA-only; make sure a CUDA-capable GPU/driver is visible when running tests or training.
 
 ###  Installation (legacy conda)
@@ -46,6 +62,8 @@ If you prefer conda (CUDA 11.3 / PyTorch 1.10.1 as in the original paper):
 ```
 git clone git@github.com:xukechun/Action-Prior-Alignment.git
 cd Action-Prior-Alignment
+
+git clone https://github.com/H-Freax/GraspNet-PointNet2-Pytorch-General-Upgrade.git models/graspnet_new
 
 conda create -n a2 python=3.8
 conda activate a2
@@ -73,6 +91,7 @@ export SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True
 RuntimeError: CUDA error: no kernel image is available for execution on the device
 ```
 solution: install torch with the right CUDA wheels (e.g., replace the `cu124` index URL above if you use a different toolkit).
+- If you see `ModuleNotFoundError: No module named 'helpers'`, you likely ran a file directly. Use `uv run python -m a2.train.main ...` (or the provided shell scripts).
 
 ###  Easy Installation
 
@@ -113,6 +132,11 @@ bash scripts/data_collection/collect_data_grasp.sh
 ```
 bash scripts/data_collection/collect_data_place.sh
 ```
+- For unified pick+place data (recreates `data/a2_pp_data.npy` and saves per-episode frames)
+```
+bash scripts/data_collection/collect_data_pp.sh
+```
+Frame dumps go to `data/a2_pp_frames` (disable with `--no_record`).
 
 ## Training
 

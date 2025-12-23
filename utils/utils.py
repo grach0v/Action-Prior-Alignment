@@ -30,7 +30,7 @@ reconstruction_config = {
 graspnet_config = {
     # Resolved at runtime to stay robust to where the script is launched.
     'graspnet_checkpoint_path': str(
-        (Path(__file__).resolve().parent.parent / 'models' / 'graspnet_new' / 'logs' / 'log_rs' / 'checkpoint.tar')
+        (Path(__file__).resolve().parent.parent / 'models' / 'graspnet_new' / 'checkpoint-rs.tar')
     ),
     'refine_approach_dist': 0.01,
     'dist_thresh': 0.05,
@@ -668,6 +668,7 @@ def rotate(image, angle, is_mask=False):
 def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sample_grasp=False, sample_place=False, downsample_interval=10, visualize=False):    
     pts = torch.from_numpy(pts)
     clip_feats = feat_dict['clip_feats']
+    device = clip_feats.device
     clip_sims = feat_dict['clip_sims'][..., 0]
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
