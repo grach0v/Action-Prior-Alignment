@@ -37,15 +37,15 @@ uv pip install -e .
 
 # build the GraspNet custom ops (requires nvcc matching your torch CUDA)
 export CUDA_HOME=/usr/local/cuda-12.4           # adjust to your CUDA install
-export PATH=$CUDA_HOME/bin:$PATH
+<!-- export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export TORCH_CUDA_ARCH_LIST="8.0+PTX"           # A100 = 8.0; adjust for your GPU
-export FORCE_CUDA=1
+export FORCE_CUDA=1 -->
 
 cd models/graspnet_new/pointnet2
-uv run python setup.py install
+uv pip install -e .
 cd ../knn
-uv run python setup.py install
+uv pip install -e .
 cd ../../..
 ```
 - Download the GraspNet pretrained weights (`checkpoint-rs.tar`) and place it at `models/graspnet_new/checkpoint-rs.tar` (or update `utils/utils.py` to point elsewhere).
@@ -68,9 +68,9 @@ git clone https://github.com/H-Freax/GraspNet-PointNet2-Pytorch-General-Upgrade.
 conda create -n a2 python=3.8
 conda activate a2
 pip install -r requirements.txt
-python setup.py develop
-cd models/graspnet_new/pointnet2 && python setup.py install
-cd ../knn && python setup.py install
+pip install -e .
+cd models/graspnet_new/pointnet2 && pip install -e .
+cd ../knn && pip install -e .
 ```
 
 ###  Potential Issues of Installation
@@ -91,6 +91,11 @@ export SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True
 RuntimeError: CUDA error: no kernel image is available for execution on the device
 ```
 solution: install torch with the right CUDA wheels (e.g., replace the `cu124` index URL above if you use a different toolkit).
+- If `knn` fails to build with `fatal error: THC/THC.h: No such file or directory`, run the patch script and rebuild:
+  ```
+  uv run python scripts/setup/patch_graspnet_knn.py
+  ```
+  (Then rerun the `pip install -e .` step inside `models/graspnet_new/knn`.)
 - If you see `ModuleNotFoundError: No module named 'helpers'`, you likely ran a file directly. Use `uv run python -m a2.train.main ...` (or the provided shell scripts).
 
 ###  Easy Installation
@@ -107,10 +112,10 @@ conda activate a2
 python setup.py develop
 
 cd models/graspnet_new/pointnet2
-python setup.py install
+pip install -e .
 
 cd ../knn
-python setup.py install
+pip install -e .
 ```
 
 ### Assets
