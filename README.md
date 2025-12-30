@@ -42,10 +42,12 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export TORCH_CUDA_ARCH_LIST="8.0+PTX"           # A100 = 8.0; adjust for your GPU
 export FORCE_CUDA=1 -->
 
+uv run python scripts/setup/patch_graspnet_knn.py
+
 cd models/graspnet_new/pointnet2
-uv pip install -e .
+uv pip install . --no-build-isolation
 cd ../knn
-uv pip install -e .
+uv pip install . --no-build-isolation
 cd ../../..
 ```
 - Download the GraspNet pretrained weights (`checkpoint-rs.tar`) and place it at `models/graspnet_new/checkpoint-rs.tar` (or update `utils/utils.py` to point elsewhere).
@@ -55,6 +57,9 @@ cd ../../..
     uv run python -m gdown "https://drive.google.com/uc?id=1hd0G8LN6tRpi4742XOTEisbTXNZ-1jmk" -O models/graspnet_new/checkpoint-rs.tar
     ```
 - Use `uv run` for any manual Python commands to ensure the local packages (like `helpers/`) resolve correctly.
+- The `pointnet2` and `knn` setup scripts import `torch` at build time; `uv` uses build isolation by default, so if you see `ModuleNotFoundError: No module named 'torch'`, re-run with `--no-build-isolation` (as shown above) after installing torch into the venv.
+- Editable installs are not supported for `pointnet2`/`knn` because they build binary extensions into a package directory that doesn't exist in source; use `pip install .` for those two.
+- If you see `ModuleNotFoundError: No module named 'models.graspnet_new.graspnet_baseline'`, make sure the GraspNet repo is cloned into `models/graspnet_new` (the wrapper loads it directly from that path).
 - The GraspNet PointNet2 ops are CUDA-only; make sure a CUDA-capable GPU/driver is visible when running tests or training.
 
 ###  Installation (legacy conda)
@@ -69,8 +74,8 @@ conda create -n a2 python=3.8
 conda activate a2
 pip install -r requirements.txt
 pip install -e .
-cd models/graspnet_new/pointnet2 && pip install -e .
-cd ../knn && pip install -e .
+cd models/graspnet_new/pointnet2 && pip install .
+cd ../knn && pip install .
 ```
 
 ###  Potential Issues of Installation
