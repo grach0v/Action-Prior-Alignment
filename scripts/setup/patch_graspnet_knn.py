@@ -86,6 +86,24 @@ def patch_setup_py(path: Path) -> bool:
     return False
 
 
+def patch_graspnet_dataset(path: Path) -> bool:
+    text = _read(path)
+    original = text
+
+    if "from torch._six import container_abcs" in text:
+        text = text.replace(
+            "from torch._six import container_abcs",
+            "from collections.abc import Mapping, Sequence",
+        )
+    text = text.replace("container_abcs.Mapping", "Mapping")
+    text = text.replace("container_abcs.Sequence", "Sequence")
+
+    if text != original:
+        _write(path, text)
+        return True
+    return False
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[2]
     knn_dir = root / "models" / "graspnet_new" / "knn"
@@ -97,6 +115,7 @@ def main() -> int:
     vision_h = knn_dir / "src" / "cuda" / "vision.h"
     knn_h = knn_dir / "src" / "knn.h"
     setup_py = knn_dir / "setup.py"
+    dataset_py = root / "models" / "graspnet_new" / "dataset" / "graspnet_dataset.py"
 
     if vision_h.exists():
         if patch_vision_h(vision_h):
@@ -115,6 +134,12 @@ def main() -> int:
             changes.append(str(setup_py))
     else:
         print(f"warn: missing {setup_py}", file=sys.stderr)
+
+    if dataset_py.exists():
+        if patch_graspnet_dataset(dataset_py):
+            changes.append(str(dataset_py))
+    else:
+        print(f"warn: missing {dataset_py}", file=sys.stderr)
 
     if changes:
         print("patched:")

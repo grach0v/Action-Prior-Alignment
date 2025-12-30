@@ -96,11 +96,11 @@ export SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL=True
 RuntimeError: CUDA error: no kernel image is available for execution on the device
 ```
 solution: install torch with the right CUDA wheels (e.g., replace the `cu124` index URL above if you use a different toolkit).
-- If `knn` fails to build with `fatal error: THC/THC.h: No such file or directory`, run the patch script and rebuild:
+- If `knn` fails to build with `fatal error: THC/THC.h: No such file or directory` **or** you see `ModuleNotFoundError: No module named 'torch._six'`, run the patch script and rebuild:
   ```
   uv run python scripts/setup/patch_graspnet_knn.py
   ```
-  (Then rerun the `pip install -e .` step inside `models/graspnet_new/knn`.)
+  (Then rerun `pip install . --no-build-isolation` inside `models/graspnet_new/knn`.)
 - If you see `ModuleNotFoundError: No module named 'helpers'`, you likely ran a file directly. Use `uv run python -m a2.train.main ...` (or the provided shell scripts).
 
 ###  Easy Installation
@@ -117,10 +117,10 @@ conda activate a2
 python setup.py develop
 
 cd models/graspnet_new/pointnet2
-pip install -e .
+pip install .
 
 cd ../knn
-pip install -e .
+pip install .
 ```
 
 ### Assets
