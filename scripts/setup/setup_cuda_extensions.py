@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Post-sync setup script for CUDA extensions.
+Post-sync setup script for GraspNet and CUDA extensions.
 
 This script:
 1. Clones the GraspNet baseline if not present
 2. Patches files for modern PyTorch compatibility
-3. Builds the pointnet2 and knn CUDA extensions
+3. Builds the pointnet2 and knn CUDA extensions (Linux/CUDA only)
 
 Run after `uv sync`:
     uv run python scripts/setup/setup_cuda_extensions.py
+
+On macOS, CUDA extensions are skipped and pure PyTorch fallbacks are used instead.
 """
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +24,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 GRASPNET_DIR = ROOT / "models" / "graspnet_new"
 GRASPNET_REPO = "https://github.com/H-Freax/GraspNet-PointNet2-Pytorch-General-Upgrade.git"
+
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
 
 
 def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -60,7 +66,11 @@ def run_patches() -> bool:
 
 
 def build_pointnet2() -> bool:
-    """Build the pointnet2 CUDA extension."""
+    """Build the pointnet2 CUDA extension (Linux only)."""
+    if IS_MACOS:
+        print("⊘ Skipping pointnet2 CUDA build on macOS (using pure PyTorch fallback)")
+        return True
+
     pointnet2_dir = GRASPNET_DIR / "pointnet2"
     if not pointnet2_dir.is_dir():
         print(f"✗ pointnet2 directory not found: {pointnet2_dir}")
@@ -85,7 +95,11 @@ def build_pointnet2() -> bool:
 
 
 def build_knn() -> bool:
-    """Build the knn CUDA extension."""
+    """Build the knn CUDA extension (Linux only)."""
+    if IS_MACOS:
+        print("⊘ Skipping knn CUDA build on macOS (using pure PyTorch fallback)")
+        return True
+
     knn_dir = GRASPNET_DIR / "knn"
     if not knn_dir.is_dir():
         print(f"✗ knn directory not found: {knn_dir}")
@@ -190,24 +204,29 @@ def verify_installation() -> bool:
 
 def main() -> int:
     print("=" * 60)
-    print("A2 - CUDA Extensions Setup")
+    print("A2 - GraspNet Setup")
     print("=" * 60)
+    print(f"Platform: {platform.system()} ({platform.machine()})")
 
-    # Check CUDA is available
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if not cuda_home:
-        # Try common paths
-        for path in ["/usr/local/cuda", "/usr/local/cuda-12.4", "/usr/local/cuda-12.1"]:
-            if Path(path).exists():
-                cuda_home = path
-                break
-
-    if cuda_home:
-        print(f"CUDA_HOME: {cuda_home}")
-        os.environ["CUDA_HOME"] = cuda_home
+    if IS_MACOS:
+        print("\n📱 macOS detected - will use pure PyTorch fallbacks for PointNet2 ops")
+        print("   (CUDA extensions will be skipped)")
     else:
-        print("⚠ CUDA_HOME not set. CUDA extensions may fail to build.")
-        print("  Set CUDA_HOME to your CUDA installation (e.g., /usr/local/cuda-12.4)")
+        # Check CUDA is available
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if not cuda_home:
+            # Try common paths
+            for path in ["/usr/local/cuda", "/usr/local/cuda-12.4", "/usr/local/cuda-12.1"]:
+                if Path(path).exists():
+                    cuda_home = path
+                    break
+
+        if cuda_home:
+            print(f"CUDA_HOME: {cuda_home}")
+            os.environ["CUDA_HOME"] = cuda_home
+        else:
+            print("⚠ CUDA_HOME not set. CUDA extensions may fail to build.")
+            print("  Set CUDA_HOME to your CUDA installation (e.g., /usr/local/cuda-12.4)")
 
     # Step 1: Clone GraspNet
     if not clone_graspnet():
