@@ -85,19 +85,20 @@ For the original conda-based installation with CUDA 11.3 / PyTorch 1.10.1, see t
 </details>
 
 ### Assets
-We provide the processed object models in this [link](https://drive.google.com/drive/folders/1WxKDFXJktoqiP0jmkDZrMCcNNBx5u-YM?usp=drive_link). Please download the file and unzip it in the `assets` folder.
+We provide the processed object models on Hugging Face: https://huggingface.co/datasets/dgrachev/a2_assets
 
 Automated download:
 ```bash
 uv run python scripts/setup/download_resources.py --assets
 ```
+To use a different repo, set `A2_ASSETS_REPO` or pass `--assets-repo`.
 
 ### Data and Pre-trained Models
 We provide our training data in this [link](https://huggingface.co/datasets/KechunXu1/A2_Dataset). Please download the file and unzip it in the `data` folder. 
 
 We provide our testing cases in this [link](https://drive.google.com/drive/folders/1OuTua-69NEeV7RYIi9nzR1jmdZEugB68?usp=sharing). Please download the file and unzip it in the `testing_cases` folder. 
 
-We provide our pre-trained models in this [link](https://drive.google.com/drive/folders/1uoDGIgkcSi8okcr8qjKOaF57TyRaHRd_?usp=sharing). Please download the file and unzip it in the `logs` folder.
+We provide our pre-trained models in this [link](https://drive.google.com/drive/folders/1uoDGIgkcSi8okcr8qjKOaF57TyRaHRd_?usp=sharing). Please download the file and unzip it in the `logs/a2_pretrained` folder.
 
 Automated download:
 ```bash

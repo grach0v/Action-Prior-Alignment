@@ -2,19 +2,27 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import re
 import shutil
 import sys
 import tarfile
 import zipfile
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 ASSETS_URL = "https://drive.google.com/drive/folders/1WxKDFXJktoqiP0jmkDZrMCcNNBx5u-YM?usp=drive_link"
+HF_ASSETS_REPO = "dgrachev/a2_assets"
 TESTING_CASES_URL = "https://drive.google.com/drive/folders/1OuTua-69NEeV7RYIi9nzR1jmdZEugB68?usp=sharing"
 PRETRAINED_URL = "https://drive.google.com/drive/folders/1uoDGIgkcSi8okcr8qjKOaF57TyRaHRd_?usp=sharing"
 HF_DATASET_REPO = "KechunXu1/A2_Dataset"
+GDRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
 def _is_within_directory(base: Path, target: Path) -> bool:
@@ -32,6 +40,56 @@ def _archive_kind(path: Path) -> str | None:
     if name.endswith(".tar.gz") or name.endswith(".tgz") or name.endswith(".tar"):
         return "tar"
     return None
+
+
+def _parse_gdrive_folder_id(url: str) -> str | None:
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _drive_api_list_children(folder_id: str, api_key: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    page_token: str | None = None
+    while True:
+        params = {
+            "q": f"'{folder_id}' in parents and trashed = false",
+            "fields": "nextPageToken, files(id, name, mimeType)",
+            "pageSize": "1000",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "key": api_key,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        url = "https://www.googleapis.com/drive/v3/files?" + urlencode(params)
+        try:
+            with urlopen(url) as resp:
+                data = json.load(resp)
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Drive API error {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Drive API request failed: {exc}") from exc
+
+        items.extend(data.get("files", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+def _drive_api_walk(folder_id: str, api_key: str, prefix: Path):
+    for item in _drive_api_list_children(folder_id, api_key):
+        name = item.get("name", "unnamed").replace(os.sep, "_")
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        if item.get("mimeType") == GDRIVE_FOLDER_MIME:
+            yield from _drive_api_walk(item_id, api_key, prefix / name)
+        else:
+            yield item_id, prefix / name
 
 
 def _safe_extract_zip(archive: Path, dest: Path) -> None:
@@ -109,6 +167,9 @@ def download_gdrive_folder(
     force: bool,
     extract: bool,
     cleanup: bool,
+    show_progress: bool = False,
+    progress_label: str = "Download",
+    api_key: str | None = None,
 ) -> bool:
     target_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -117,18 +178,153 @@ def download_gdrive_folder(
         print("gdown not installed; run `uv sync`.", file=sys.stderr)
         return False
 
+    if api_key:
+        folder_id = _parse_gdrive_folder_id(url)
+        if not folder_id:
+            print("Warning: could not parse Google Drive folder ID, using gdown fallback.")
+        else:
+            try:
+                files = list(_drive_api_walk(folder_id, api_key, Path(".")))
+            except RuntimeError as exc:
+                print(f"Drive API listing failed, using gdown fallback: {exc}")
+                files = None
+
+            if files is not None:
+                pending = []
+                existing = 0
+                for file_id, rel_path in files:
+                    local_path = target_dir / rel_path
+                    if not force and local_path.exists():
+                        existing += 1
+                        continue
+                    pending.append((file_id, rel_path, local_path))
+
+                if existing:
+                    print(f"Already present: {existing} files in {target_dir}")
+                if not pending:
+                    print(f"No files to download for {progress_label.lower()}")
+                else:
+                    try:
+                        from tqdm import tqdm
+                    except ImportError:
+                        tqdm = None
+
+                    total = len(pending)
+                    if show_progress and tqdm is not None:
+                        with tqdm(total=total, desc=progress_label, unit="file", ascii=True) as pbar:
+                            for file_id, rel_path, local_path in pending:
+                                local_path.parent.mkdir(parents=True, exist_ok=True)
+                                result = gdown.download(
+                                    url=f"https://drive.google.com/uc?id={file_id}",
+                                    output=str(local_path),
+                                    quiet=True,
+                                    resume=not force,
+                                )
+                                if result is None:
+                                    print(f"Failed to download {rel_path}", file=sys.stderr)
+                                    return False
+                                pbar.update(1)
+                    else:
+                        print(f"Downloading {total} files for {progress_label.lower()}...")
+                        for idx, (file_id, rel_path, local_path) in enumerate(pending, 1):
+                            local_path.parent.mkdir(parents=True, exist_ok=True)
+                            result = gdown.download(
+                                url=f"https://drive.google.com/uc?id={file_id}",
+                                output=str(local_path),
+                                quiet=True,
+                                resume=not force,
+                            )
+                            if result is None:
+                                print(f"Failed to download {rel_path}", file=sys.stderr)
+                                return False
+                            if show_progress:
+                                print(f"[{idx}/{total}] {rel_path}")
+
+                if extract:
+                    extract_archives(target_dir, cleanup)
+                return True
+
     before = {p.name for p in target_dir.iterdir()}
-    if before and not force:
-        print(f"Merging into existing folder: {target_dir}")
+    if show_progress:
+        print(f"Scanning Google Drive folder for {progress_label.lower()}...")
+        files = gdown.download_folder(
+            url=url,
+            output=str(target_dir),
+            quiet=True,
+            remaining_ok=True,
+            skip_download=True,
+        )
+        if files is None:
+            print("Failed to retrieve folder contents.", file=sys.stderr)
+            return False
+
+        print(
+            "Note: gdown listings are limited to ~50 items per folder. "
+            "If downloads stop early, set GDRIVE_API_KEY and rerun."
+        )
+
+        pending = []
+        existing = 0
+        for item in files:
+            local_path = Path(item.local_path)
+            if not force and local_path.exists():
+                existing += 1
+                continue
+            pending.append(item)
+
+        if existing:
+            print(f"Already present: {existing} files in {target_dir}")
+        if not pending:
+            print(f"No files to download for {progress_label.lower()}")
+        else:
+            try:
+                from tqdm import tqdm
+            except ImportError:
+                tqdm = None
+
+            total = len(pending)
+            if tqdm is None:
+                print(f"Downloading {total} files for {progress_label.lower()}...")
+                for idx, item in enumerate(pending, 1):
+                    local_path = Path(item.local_path)
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    result = gdown.download(
+                        url=f"https://drive.google.com/uc?id={item.id}",
+                        output=str(local_path),
+                        quiet=True,
+                        resume=not force,
+                    )
+                    if result is None:
+                        print(f"Failed to download {item.path}", file=sys.stderr)
+                        return False
+                    print(f"[{idx}/{total}] {item.path}")
+            else:
+                with tqdm(total=total, desc=progress_label, unit="file", ascii=True) as pbar:
+                    for item in pending:
+                        local_path = Path(item.local_path)
+                        local_path.parent.mkdir(parents=True, exist_ok=True)
+                        result = gdown.download(
+                            url=f"https://drive.google.com/uc?id={item.id}",
+                            output=str(local_path),
+                            quiet=True,
+                            resume=not force,
+                        )
+                        if result is None:
+                            print(f"Failed to download {item.path}", file=sys.stderr)
+                            return False
+                        pbar.update(1)
     else:
-        print(f"Downloading Google Drive folder to {target_dir}...")
-    gdown.download_folder(
-        url=url,
-        output=str(target_dir),
-        quiet=False,
-        remaining_ok=True,
-        resume=not force,
-    )
+        if before and not force:
+            print(f"Merging into existing folder: {target_dir}")
+        else:
+            print(f"Downloading Google Drive folder to {target_dir}...")
+        gdown.download_folder(
+            url=url,
+            output=str(target_dir),
+            quiet=False,
+            remaining_ok=True,
+            resume=not force,
+        )
     _normalize_download_root(target_dir, before)
 
     if extract:
@@ -136,7 +332,15 @@ def download_gdrive_folder(
     return True
 
 
-def download_hf_dataset(repo_id: str, target_dir: Path, *, force: bool) -> bool:
+def download_hf_dataset(
+    repo_id: str,
+    target_dir: Path,
+    *,
+    force: bool,
+    allow_patterns: list[str] | str | None = None,
+    ignore_patterns: list[str] | str | None = None,
+    label: str = "dataset",
+) -> bool:
     target_dir.mkdir(parents=True, exist_ok=True)
     try:
         from huggingface_hub import snapshot_download
@@ -147,7 +351,7 @@ def download_hf_dataset(repo_id: str, target_dir: Path, *, force: bool) -> bool:
     if next(target_dir.iterdir(), None) is not None and not force:
         print(f"Merging into existing folder: {target_dir}")
     else:
-        print(f"Downloading Hugging Face dataset {repo_id} to {target_dir}...")
+        print(f"Downloading Hugging Face {label} {repo_id} to {target_dir}...")
     snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
@@ -155,6 +359,8 @@ def download_hf_dataset(repo_id: str, target_dir: Path, *, force: bool) -> bool:
         local_dir_use_symlinks=False,
         resume_download=True,
         force_download=force,
+        allow_patterns=allow_patterns,
+        ignore_patterns=ignore_patterns,
     )
     return True
 
@@ -164,6 +370,17 @@ def parse_args() -> argparse.Namespace:
         description="Download A2 assets, data, testing cases, and pretrained models."
     )
     parser.add_argument("--assets", action="store_true", help="Download assets to ./assets")
+    parser.add_argument(
+        "--assets-source",
+        choices=["hf", "gdrive"],
+        default="hf",
+        help="Where to download assets from (default: hf).",
+    )
+    parser.add_argument(
+        "--assets-repo",
+        default=None,
+        help="Hugging Face dataset repo for assets (default: dgrachev/a2_assets).",
+    )
     parser.add_argument("--data", action="store_true", help="Download dataset to ./data")
     parser.add_argument(
         "--testing-cases",
@@ -175,12 +392,17 @@ def parse_args() -> argparse.Namespace:
         "--pretrained-models",
         action="store_true",
         dest="pretrained_models",
-        help="Download pretrained models to ./logs",
+        help="Download pretrained models to ./logs/a2_pretrained",
     )
     parser.add_argument("--all", action="store_true", help="Download everything")
     parser.add_argument("--force", action="store_true", help="Re-download even if target has content")
     parser.add_argument("--no-extract", action="store_true", help="Skip archive extraction")
     parser.add_argument("--cleanup", action="store_true", help="Remove archives after extraction")
+    parser.add_argument(
+        "--gdrive-api-key",
+        default=None,
+        help="Google Drive API key (or set GDRIVE_API_KEY) to bypass the 50-item folder limit.",
+    )
     return parser.parse_args()
 
 
@@ -192,15 +414,30 @@ def main() -> int:
         args.testing_cases = True
         args.pretrained_models = True
 
+    gdrive_api_key = args.gdrive_api_key or os.environ.get("GDRIVE_API_KEY")
+    assets_repo = args.assets_repo or os.environ.get("A2_ASSETS_REPO") or HF_ASSETS_REPO
+
     ok = True
     if args.assets:
-        ok &= download_gdrive_folder(
-            ASSETS_URL,
-            ROOT / "assets",
-            force=args.force,
-            extract=not args.no_extract,
-            cleanup=args.cleanup,
-        )
+        if args.assets_source == "gdrive":
+            ok &= download_gdrive_folder(
+                ASSETS_URL,
+                ROOT / "assets",
+                force=args.force,
+                extract=not args.no_extract,
+                cleanup=args.cleanup,
+                show_progress=True,
+                progress_label="Assets",
+                api_key=gdrive_api_key,
+            )
+        else:
+            ok &= download_hf_dataset(
+                assets_repo,
+                ROOT / "assets",
+                force=args.force,
+                allow_patterns=["simplified_objects/**", "unseen_objects/**"],
+                label="assets dataset",
+            )
     if args.data:
         ok &= download_hf_dataset(HF_DATASET_REPO, ROOT / "data", force=args.force)
     if args.testing_cases:
@@ -210,14 +447,16 @@ def main() -> int:
             force=args.force,
             extract=not args.no_extract,
             cleanup=args.cleanup,
+            api_key=gdrive_api_key,
         )
     if args.pretrained_models:
         ok &= download_gdrive_folder(
             PRETRAINED_URL,
-            ROOT / "logs",
+            ROOT / "logs" / "a2_pretrained",
             force=args.force,
             extract=not args.no_extract,
             cleanup=args.cleanup,
+            api_key=gdrive_api_key,
         )
 
     return 0 if ok else 1
