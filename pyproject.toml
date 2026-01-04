@@ -124,9 +124,6 @@ exclude = ["models.graspnet_new*"]
 "*" = ["*.yaml", "*.json", "*.txt"]
 
 [tool.uv]
-# Use PyTorch CUDA 12.4 wheels by default
-# Change cu124 to cu118/cu121 for other CUDA versions
-
 # Override deprecated/pinned dependencies from graspnetAPI
 # graspnetAPI has overly strict pins that conflict with modern packages
 override-dependencies = [
@@ -142,15 +139,18 @@ override-dependencies = [
     "trimesh>=4.0.0",
 ]
 
+# CUDA 12.4 wheels for Linux (default)
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
-torchaudio = { index = "pytorch-cu124" }
+# On Linux with CUDA, use CUDA wheels
+# On macOS, uv will automatically fall back to default PyPI (which has MPS support)
+torch = { index = "pytorch-cu124", marker = "sys_platform == 'linux'" }
+torchvision = { index = "pytorch-cu124", marker = "sys_platform == 'linux'" }
+torchaudio = { index = "pytorch-cu124", marker = "sys_platform == 'linux'" }
 
 [tool.ruff]
 line-length = 120

@@ -22,15 +22,18 @@ try:
 except:
     import __builtin__ as builtins
 
+# Try CUDA extensions, fall back to pure PyTorch if not available
+_USE_CUDA_OPS = False
+_ext = None
+
 try:
     import pointnet2._ext as _ext
+    _USE_CUDA_OPS = True
 except ImportError:
     if not getattr(builtins, "__POINTNET2_SETUP__", False):
-        raise ImportError(
-            "Could not import _ext module.\n"
-            "Please see the setup instructions in the README: "
-            "https://github.com/erikwijmans/Pointnet2_PyTorch/blob/master/README.rst"
-        )
+        # Use fallback implementations
+        from models import pointnet2_ops_fallback as _fallback
+        print("Note: Using pure PyTorch PointNet2 fallback (no CUDA)", file=sys.stderr)
 
 if False:
     # Workaround for type hints without depending on the `typing` module
@@ -68,7 +71,10 @@ class FurthestPointSampling(Function):
         torch.Tensor
             (B, npoint) tensor containing the set
         """
-        return _ext.furthest_point_sampling(xyz, npoint)
+        if _USE_CUDA_OPS:
+            return _ext.furthest_point_sampling(xyz, npoint)
+        else:
+            return _fallback.farthest_point_sample(xyz, npoint)
 
     @staticmethod
     def backward(xyz, a=None):
@@ -101,14 +107,26 @@ class GatherOperation(Function):
         _, C, N = features.size()
 
         ctx.for_backwards = (idx, C, N)
+        ctx.save_for_backward(idx)
 
-        return _ext.gather_points(features, idx)
+        if _USE_CUDA_OPS:
+            return _ext.gather_points(features, idx)
+        else:
+            return _fallback.gather_operation(features, idx)
 
     @staticmethod
     def backward(ctx, grad_out):
         idx, C, N = ctx.for_backwards
 
-        grad_features = _ext.gather_points_grad(grad_out.contiguous(), idx, N)
+        if _USE_CUDA_OPS:
+            grad_features = _ext.gather_points_grad(grad_out.contiguous(), idx, N)
+        else:
+            # Pure PyTorch backward - scatter gradients
+            idx_saved, = ctx.saved_tensors
+            B = grad_out.shape[0]
+            grad_features = torch.zeros(B, grad_out.shape[1], N, device=grad_out.device, dtype=grad_out.dtype)
+            idx_expanded = idx_saved.unsqueeze(1).expand_as(grad_out)
+            grad_features.scatter_add_(2, idx_expanded, grad_out)
         return grad_features, None
 
 
@@ -135,9 +153,11 @@ class ThreeNN(Function):
         idx : torch.Tensor
             (B, n, 3) index of 3 nearest neighbors
         """
-        dist2, idx = _ext.three_nn(unknown, known)
-
-        return torch.sqrt(dist2), idx
+        if _USE_CUDA_OPS:
+            dist2, idx = _ext.three_nn(unknown, known)
+            return torch.sqrt(dist2), idx
+        else:
+            return _fallback.three_nn(unknown, known)
 
     @staticmethod
     def backward(ctx, a=None, b=None):
@@ -171,8 +191,12 @@ class ThreeInterpolate(Function):
         n = idx.size(1)
 
         ctx.three_interpolate_for_backward = (idx, weight, m)
+        ctx.save_for_backward(features, idx, weight)
 
-        return _ext.three_interpolate(features, idx, weight)
+        if _USE_CUDA_OPS:
+            return _ext.three_interpolate(features, idx, weight)
+        else:
+            return _fallback.three_interpolate(features, idx, weight)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -194,9 +218,20 @@ class ThreeInterpolate(Function):
         """
         idx, weight, m = ctx.three_interpolate_for_backward
 
-        grad_features = _ext.three_interpolate_grad(
-            grad_out.contiguous(), idx, weight, m
-        )
+        if _USE_CUDA_OPS:
+            grad_features = _ext.three_interpolate_grad(
+                grad_out.contiguous(), idx, weight, m
+            )
+        else:
+            # Pure PyTorch backward
+            features, idx_saved, weight_saved = ctx.saved_tensors
+            B, c, n = grad_out.shape
+            grad_features = torch.zeros(B, c, m, device=grad_out.device, dtype=grad_out.dtype)
+            # grad_out: (B, c, n), weight: (B, n, 3), idx: (B, n, 3)
+            for k in range(3):
+                idx_k = idx_saved[:, :, k:k+1].expand(B, n, c).permute(0, 2, 1)  # (B, c, n)
+                weight_k = weight_saved[:, :, k:k+1].permute(0, 2, 1).expand(B, c, n)  # (B, c, n)
+                grad_features.scatter_add_(2, idx_k, grad_out * weight_k)
 
         return grad_features, None, None
 
@@ -226,8 +261,12 @@ class GroupingOperation(Function):
         _, C, N = features.size()
 
         ctx.for_backwards = (idx, N)
+        ctx.save_for_backward(idx)
 
-        return _ext.group_points(features, idx)
+        if _USE_CUDA_OPS:
+            return _ext.group_points(features, idx)
+        else:
+            return _fallback.grouping_operation(features, idx)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -247,7 +286,16 @@ class GroupingOperation(Function):
         """
         idx, N = ctx.for_backwards
 
-        grad_features = _ext.group_points_grad(grad_out.contiguous(), idx, N)
+        if _USE_CUDA_OPS:
+            grad_features = _ext.group_points_grad(grad_out.contiguous(), idx, N)
+        else:
+            # Pure PyTorch backward
+            idx_saved, = ctx.saved_tensors
+            B, C, npoint, nsample = grad_out.shape
+            grad_features = torch.zeros(B, C, N, device=grad_out.device, dtype=grad_out.dtype)
+            # idx: (B, npoint, nsample), grad_out: (B, C, npoint, nsample)
+            idx_expanded = idx_saved.unsqueeze(1).expand(B, C, npoint, nsample)
+            grad_features.scatter_add_(2, idx_expanded.reshape(B, C, -1), grad_out.reshape(B, C, -1))
 
         return grad_features, None
 
@@ -277,7 +325,10 @@ class BallQuery(Function):
         torch.Tensor
             (B, npoint, nsample) tensor with the indicies of the features that form the query balls
         """
-        return _ext.ball_query(new_xyz, xyz, radius, nsample)
+        if _USE_CUDA_OPS:
+            return _ext.ball_query(new_xyz, xyz, radius, nsample)
+        else:
+            return _fallback.query_ball_point(radius, nsample, xyz, new_xyz)
 
     @staticmethod
     def backward(ctx, a=None):
@@ -448,7 +499,10 @@ class CylinderQuery(Function):
         torch.Tensor
             (B, npoint, nsample) tensor with the indicies of the features that form the query balls
         """
-        return _ext.cylinder_query(new_xyz, xyz, rot, radius, hmin, hmax, nsample)
+        if _USE_CUDA_OPS:
+            return _ext.cylinder_query(new_xyz, xyz, rot, radius, hmin, hmax, nsample)
+        else:
+            return _fallback.cylinder_query(radius, hmin, hmax, nsample, xyz, new_xyz, rot)
 
     @staticmethod
     def backward(ctx, a=None):

@@ -43,6 +43,32 @@ That's it! The setup script will:
 uv sync --extra lerobot
 ```
 
+### macOS (Apple Silicon M1-M4)
+
+The project now includes **pure PyTorch fallbacks** for the CUDA extensions, so GraspNet works on Mac (slower, but functional):
+
+```bash
+git clone git@github.com:grach0v/Action-Prior-Alignment.git
+cd Action-Prior-Alignment
+
+# Install dependencies (PyTorch will use MPS backend automatically)
+uv sync
+
+# Clone GraspNet (no CUDA build needed - fallbacks are used automatically)
+git clone https://github.com/H-Freax/GraspNet-PointNet2-Pytorch-General-Upgrade.git models/graspnet_new
+```
+
+To use MPS acceleration:
+```python
+import torch
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+```
+
+> **Note:** The pure PyTorch fallbacks are slower than CUDA but fully functional. You'll see a message like "Using pure PyTorch PointNet2 fallback (no CUDA)" on startup.
+
+**Known Mac issues:**
+- `pybullet` may fail to build on Apple Silicon ([issue](https://github.com/bulletphysics/bullet3/issues/4712)). Try `conda install -c conda-forge pybullet` or comment it out in `pyproject.toml` if you don't need simulation.
+
 ### Troubleshooting
 
 - **`ModuleNotFoundError: No module named 'torch'`** during extension build: The setup script uses `--no-build-isolation` to handle this automatically.
