@@ -87,8 +87,9 @@ def build_pointnet2() -> bool:
         pass
 
     # Build with --no-build-isolation since setup.py imports torch
+    # Use uv pip install since uv-managed environments don't have pip
     run(
-        [sys.executable, "-m", "pip", "install", ".", "--no-build-isolation", "-v"],
+        ["uv", "pip", "install", ".", "--no-build-isolation", "-v"],
         cwd=pointnet2_dir
     )
     return True
@@ -116,8 +117,9 @@ def build_knn() -> bool:
         pass
 
     # Build with --no-build-isolation since setup.py imports torch
+    # Use uv pip install since uv-managed environments don't have pip
     run(
-        [sys.executable, "-m", "pip", "install", ".", "--no-build-isolation", "-v"],
+        ["uv", "pip", "install", ".", "--no-build-isolation", "-v"],
         cwd=knn_dir
     )
     return True
@@ -187,10 +189,13 @@ def verify_installation() -> bool:
 
     # Check GraspNet
     graspnet_baseline = GRASPNET_DIR / "graspnet_baseline.py"
-    if graspnet_baseline.exists():
+    graspnet_model = GRASPNET_DIR / "models" / "graspnet.py"
+    if graspnet_baseline.exists() or graspnet_model.exists():
         print("✓ GraspNet baseline present")
     else:
-        errors.append("GraspNet baseline not found")
+        errors.append(
+            "GraspNet baseline not found (expected graspnet_baseline.py or models/graspnet.py)"
+        )
 
     if errors:
         print("\n⚠ Some components failed:")
