@@ -55,6 +55,14 @@ class Environment:
             pb.resetDebugVisualizerCamera(
                 cameraDistance=1.5, cameraYaw=90, cameraPitch=-25, cameraTargetPosition=target,
             )
+
+        # VLA frame recording state
+        self._frame_recorder = None
+        self._recording_fps = 30
+        self._recording_cameras = None  # None means all cameras
+        self._steps_per_frame = int((1 / time_step) / 30)  # Default: 240/30 = 8
+        self._step_counter = 0
+        self._current_action = None
             
 
     @property
@@ -221,7 +229,11 @@ class Environment:
         self.reference_obj_ids = []
         self.obj_labels = {}
         self.obj_dirs = {}
-        
+
+        # Temporarily disable VLA recording during reset
+        saved_recorder = self._frame_recorder
+        self._frame_recorder = None
+
         pb.resetSimulation()
         pb.setGravity(0, 0, -9.8)
 
@@ -296,6 +308,9 @@ class Environment:
             pb.configureDebugVisualizer(
                 pb.COV_ENABLE_RENDERING, 1, physicsClientId=self._client_id
             )
+
+        # Restore VLA recording after reset is complete
+        self._frame_recorder = saved_recorder
 
     def setup_gripper(self):
         """Load end-effector: gripper"""
@@ -440,6 +455,112 @@ class Environment:
     def seed(self, seed=None):
         self._random = np.random.RandomState(seed)
         return seed
+
+    # ========== VLA Frame Recording Methods ==========
+
+    def set_frame_recorder(self, recorder_callback, fps=30, cameras=None):
+        """Set callback for VLA frame recording during robot movements.
+
+        Args:
+            recorder_callback: Callable that takes (images_dict, robot_state_dict).
+            fps: Recording frames per second.
+            cameras: List of camera names to record ['front', 'left', 'right'].
+                    If None, all cameras are recorded.
+        """
+        self._frame_recorder = recorder_callback
+        self._recording_fps = fps
+        self._recording_cameras = cameras  # None means all cameras
+        self._steps_per_frame = max(1, int((1 / self.time_step) / fps))
+        self._step_counter = 0
+        cam_str = ', '.join(cameras) if cameras else 'all'
+        print(f"Frame recorder set: {fps} FPS, cameras: {cam_str}, record every {self._steps_per_frame} steps")
+
+    def clear_frame_recorder(self):
+        """Clear the frame recorder callback."""
+        self._frame_recorder = None
+        self._current_action = None
+        self._step_counter = 0
+
+    def set_current_action(self, action):
+        """Set the current action being executed (for recording context)."""
+        self._current_action = np.array(action, dtype=np.float32)
+
+    def get_robot_state(self):
+        """Get current robot state for recording.
+
+        Returns:
+            dict with: ee_pos (3,), ee_quat (4,), joints (6,), gripper_angle (float)
+        """
+        # End effector pose
+        ee_pos, ee_quat = self.get_link_pose(self.ur5e, self.ur5e_ee_id)
+
+        # Joint positions (6 joints for UR5e)
+        joints = np.array([
+            pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0]
+            for i in self.ur5e_joints
+        ], dtype=np.float32)
+
+        # Gripper angle
+        gripper_angle = pb.getJointState(
+            self.ee, self.gripper_main_joint, physicsClientId=self._client_id
+        )[0]
+
+        return {
+            'ee_pos': np.array(ee_pos, dtype=np.float32),
+            'ee_quat': np.array(ee_quat, dtype=np.float32),
+            'joints': joints,
+            'gripper_angle': float(gripper_angle)
+        }
+
+    # Camera name to index mapping
+    CAMERA_INDICES = {
+        'front': 0,
+        'left': 1,
+        'right': 2,
+        'top': 3,       # new_front - top-down view
+        'side_left': 4,  # new_left
+        'side_right': 5, # new_right
+        'overview': 6,   # overview - sees robot and scene
+    }
+
+    def get_camera_images(self, cameras=None):
+        """Get RGB images from RealSense cameras.
+
+        Args:
+            cameras: List of camera names to capture.
+                    Available: front, left, right, top, side_left, side_right, overview
+                    If None, captures front, left, right.
+
+        Returns:
+            dict with camera_name: (H, W, 3) uint8 arrays
+        """
+        images = {}
+        default_cams = ['front', 'left', 'right']
+        cam_names = cameras if cameras else default_cams
+        for name in cam_names:
+            if name not in self.CAMERA_INDICES:
+                raise ValueError(f"Unknown camera '{name}'. Available: {list(self.CAMERA_INDICES.keys())}")
+            i = self.CAMERA_INDICES[name]
+            config = self.agent_cams[i]
+            color, _, _ = self.render_camera(config)
+            images[name] = color
+        return images
+
+    def _maybe_record_frame(self):
+        """Check if we should record a frame and do so if needed."""
+        if self._frame_recorder is None:
+            return
+
+        self._step_counter += 1
+        if self._step_counter >= self._steps_per_frame:
+            self._step_counter = 0
+            # Capture images (only requested cameras) and robot state
+            images = self.get_camera_images(self._recording_cameras)
+            robot_state = self.get_robot_state()
+            # Call the recorder callback
+            self._frame_recorder(images, robot_state)
+
+    # ========== End VLA Recording Methods ==========
 
     def render_camera(self, config):
         """Render RGB-D image with specified camera configuration."""
@@ -1150,8 +1271,10 @@ class Environment:
 
     def move_joints(self, target_joints, speed=0.01, timeout=3):
         """Move UR5e to target joint configuration."""
+        # Increase timeout when recording (camera rendering adds ~100ms per frame)
+        effective_timeout = timeout * 10 if self._frame_recorder is not None else timeout
         t0 = time.time()
-        while (time.time() - t0) < timeout:
+        while (time.time() - t0) < effective_timeout:
             current_joints = np.array(
                 [
                     pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0]
@@ -1168,6 +1291,7 @@ class Environment:
                 # give time to stop
                 for _ in range(5):
                     pb.stepSimulation()
+                    self._maybe_record_frame()
                 return True
 
             # Move with constant velocity
@@ -1182,7 +1306,8 @@ class Environment:
                 positionGains=np.ones(len(self.ur5e_joints)),
             )
             pb.stepSimulation()
-        print(f"Warning: move_joints exceeded {timeout} second timeout. Skipping.")
+            self._maybe_record_frame()
+        print(f"Warning: move_joints exceeded {effective_timeout} second timeout. Skipping.")
         return False
 
     def move_ee_pose(self, pose, speed=0.01):
@@ -1478,6 +1603,8 @@ class Environment:
         return gripper_angle < self.gripper_angle_close_threshold
 
     def _move_gripper(self, target_angle, timeout=3, is_slow=False):
+        # Increase timeout when recording (camera rendering adds significant time)
+        effective_timeout = timeout * 10 if self._frame_recorder is not None else timeout
         t0 = time.time()
         prev_angle = pb.getJointState(
             self.ee, self.gripper_main_joint, physicsClientId=self._client_id
@@ -1504,7 +1631,8 @@ class Environment:
             )
             for _ in range(10):
                 pb.stepSimulation()
-            while (time.time() - t0) < timeout:
+                self._maybe_record_frame()
+            while (time.time() - t0) < effective_timeout:
                 current_angle = pb.getJointState(self.ee, self.gripper_main_joint)[0]
                 diff_angle = abs(current_angle - prev_angle)
                 if diff_angle < 1e-4:
@@ -1512,6 +1640,7 @@ class Environment:
                 prev_angle = current_angle
                 for _ in range(10):
                     pb.stepSimulation()
+                    self._maybe_record_frame()
         # maintain the angles
         pb.setJointMotorControl2(
             self.ee,
@@ -1529,6 +1658,8 @@ class Environment:
         )
         for _ in range(10):
             pb.stepSimulation()
+            self._maybe_record_frame()
+
 
 class DebugAxes(object):
     """

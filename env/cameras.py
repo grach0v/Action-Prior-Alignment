@@ -43,7 +43,12 @@ class RealSenseL515:
     new_right_position = (0.8, -0.35, 0.5)
     new_right_rotation = (np.pi / 4.5, np.pi, -3 * np.pi / 4)
     new_right_rotation = p.getQuaternionFromEuler(new_right_rotation)
-    
+
+    # Overview camera - like front but further back and higher to see whole robot
+    overview_position = (1.2, 0, 0.85)  # Further back and higher than front
+    overview_rotation = (np.pi / 3.5, np.pi, -np.pi / 2)  # Steeper angle to see robot
+    overview_rotation = p.getQuaternionFromEuler(overview_rotation)
+
     # Default camera configs.
     CONFIG = [
         {
@@ -91,6 +96,14 @@ class RealSenseL515:
             "intrinsics": intrinsics,
             "position": new_right_position,
             "rotation": new_right_rotation,
+            "zrange": (0.01, 9.0),
+            "noise": False,
+        },
+        {
+            "image_size": image_size,
+            "intrinsics": intrinsics,
+            "position": overview_position,
+            "rotation": overview_rotation,
             "zrange": (0.01, 9.0),
             "noise": False,
         },

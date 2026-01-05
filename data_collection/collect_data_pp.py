@@ -4,6 +4,10 @@ import os
 import random
 import shutil
 import datetime
+import warnings
+
+# Suppress pydantic warnings from lerobot
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 import numpy as np
 import torch
@@ -40,6 +44,45 @@ def parse_args():
     parser.add_argument("--no_record", action="store_true", default=False)
     parser.add_argument("--log_suffix", type=str, default="recreate-pp")
     parser.add_argument("--visualize", action="store_true", default=False)
+
+    # Model loading options for faster data collection
+    parser.add_argument('--load_model', action='store_true', default=False,
+                        help='Load trained model for action selection')
+    parser.add_argument('--model_path', type=str, default='',
+                        help='Path to trained model checkpoint')
+
+    # Transformer model parameters (required when loading model)
+    parser.add_argument('--ratio', type=float, default=0.2)
+    parser.add_argument('--fusion_sa', action='store_true', default=False)
+    parser.add_argument('--layer_norm', action='store_true', default=False)
+    parser.add_argument('--lang_emb', action='store_true', default=False)
+    parser.add_argument('--lang_enc', type=str, default='longclip')
+    parser.add_argument('--use_rope', action='store_true', default=False)
+    parser.add_argument('--no_feat_rope', action='store_true', default=False)
+    parser.add_argument('--no_rgb_feat', action='store_true', default=False)
+    parser.add_argument('--normalize', action='store_true', default=False)
+    parser.add_argument('--adaptive', action='store_true', default=False)
+    parser.add_argument('--adaptive_type', type=str, default='policy')
+    parser.add_argument('--task_emb', action='store_true', default=False)
+    parser.add_argument('--width', type=int, default=768)
+    parser.add_argument('--layers', type=int, default=1)
+    parser.add_argument('--heads', type=int, default=8)
+    parser.add_argument('--hidden_size', type=int, default=384)
+
+    # VLA recording options
+    parser.add_argument('--record_vla', action='store_true', default=False,
+                        help='Enable VLA recording to LeRobot dataset')
+    parser.add_argument('--vla_output', type=str, default='data/vla_pp',
+                        help='Output directory for VLA dataset')
+    parser.add_argument('--vla_repo_id', type=str, default='local/pp_vla',
+                        help='Repository ID for LeRobot dataset')
+    parser.add_argument('--vla_fps', type=int, default=30,
+                        help='Recording FPS for VLA data')
+    parser.add_argument('--vla_image_size', type=int, nargs=2, default=[480, 640],
+                        metavar=('HEIGHT', 'WIDTH'),
+                        help='Image size for VLA recording (default: 480 640)')
+    parser.add_argument('--vla_cameras', type=str, default='front,overview',
+                        help='Comma-separated cameras: front,left,right,top,side_left,side_right,overview (default: front,overview)')
 
     return parser.parse_args()
 
@@ -120,7 +163,7 @@ def save_camera_configs(record_dir, extrinsics, intrinsics):
     np.save(os.path.join(record_dir, "camera_intrinsics.npy"), intrinsics)
 
 
-def collect_grasp(args, dataset, record_dir):
+def collect_grasp(args, dataset, record_dir, vla_recorder=None, trained_agent=None):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.device = device
@@ -138,10 +181,22 @@ def collect_grasp(args, dataset, record_dir):
         feat_backbone=args.feat_backbone,
         device=device,
     )
-    if args.agent == "clip":
+
+    # Use trained agent if provided, otherwise use mb/clip agent
+    if trained_agent is not None:
+        agent = trained_agent
+        use_trained_model = True
+    elif args.agent == "clip":
         agent = CLIPGrasp(args)
+        use_trained_model = False
     else:
         agent = MBGrasp(args)
+        use_trained_model = False
+
+    # Set up VLA recording if provided
+    if vla_recorder is not None:
+        cameras = [c.strip() for c in args.vla_cameras.split(',')]
+        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras)
 
     extrinsics, intrinsics = utils.get_camera_configs(env)
     logger.save_camera_configs(extrinsics, intrinsics)
@@ -170,6 +225,10 @@ def collect_grasp(args, dataset, record_dir):
         recorder = None
         if record_dir is not None:
             recorder = EpisodeRecorder(record_dir, "grasp", episode, lang_goal)
+
+        # Start VLA recording for this episode
+        if vla_recorder is not None:
+            vla_recorder.start_episode(task=lang_goal)
 
         while not done:
             out_of_workspace = []
@@ -224,7 +283,13 @@ def collect_grasp(args, dataset, record_dir):
                 )
             )
 
-            if args.agent == "clip":
+            if use_trained_model:
+                # Use trained model for action selection
+                with torch.no_grad():
+                    logits, action_idx = agent.select_action(
+                        sampled_pts, sampled_clip_feats, sampled_clip_sims, grasps
+                    )
+            elif args.agent == "clip":
                 if len(grasp_pose_set) == 1:
                     action_idx = 0
                 else:
@@ -245,7 +310,16 @@ def collect_grasp(args, dataset, record_dir):
                     color_images, depth_images, robot_state, action, action_idx
                 )
 
+            # Set action for VLA recording before executing
+            if vla_recorder is not None:
+                vla_recorder.set_action(action, attempt_idx=episode_steps)
+
             reward, done = env.step(action)
+
+            # Update step result for VLA recording
+            if vla_recorder is not None:
+                vla_recorder.update_step_result(reward=reward, success=done)
+
             episode_steps += 1
             iteration += 1
             episode_reward += reward
@@ -277,6 +351,10 @@ def collect_grasp(args, dataset, record_dir):
             if done or episode_steps == args.max_episode_step:
                 break
 
+        # End VLA recording for this episode
+        if vla_recorder is not None:
+            vla_recorder.end_episode(success=done, total_reward=episode_reward, num_attempts=episode_steps)
+
         if recorder is not None:
             if done:
                 recorder.commit()
@@ -296,7 +374,7 @@ def collect_grasp(args, dataset, record_dir):
         )
 
 
-def collect_place(args, dataset, record_dir):
+def collect_place(args, dataset, record_dir, vla_recorder=None, trained_agent=None):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -312,6 +390,15 @@ def collect_place(args, dataset, record_dir):
         feat_backbone=args.feat_backbone,
         device=device,
     )
+
+    # Note: trained_agent currently not used for place (uses random selection)
+    # but kept for future expansion
+    use_trained_model = trained_agent is not None
+
+    # Set up VLA recording if provided
+    if vla_recorder is not None:
+        cameras = [c.strip() for c in args.vla_cameras.split(',')]
+        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras)
 
     extrinsics, intrinsics = utils.get_camera_configs(env)
     logger.save_camera_configs(extrinsics, intrinsics)
@@ -381,6 +468,10 @@ def collect_place(args, dataset, record_dir):
 
             if recorder is None and record_dir is not None:
                 recorder = EpisodeRecorder(record_dir, "place", episode, lang_goal)
+
+            # Start VLA recording for this episode (after lang_goal is known)
+            if vla_recorder is not None and not vla_recorder.is_recording:
+                vla_recorder.start_episode(task=lang_goal)
 
             out_of_workspace = []
             for obj_id in env.reference_obj_ids:
@@ -477,8 +568,17 @@ def collect_place(args, dataset, record_dir):
                     color_images, depth_images, robot_state, action, action_idx
                 )
 
+            # Set action for VLA recording before executing
+            if vla_recorder is not None:
+                vla_recorder.set_action(action, attempt_idx=episode_steps)
+
             reward = 2
             done = True
+
+            # Update step result for VLA recording
+            if vla_recorder is not None:
+                vla_recorder.update_step_result(reward=reward, success=done)
+
             episode_steps += 1
             iteration += 1
             episode_reward += reward
@@ -504,6 +604,10 @@ def collect_place(args, dataset, record_dir):
             if done:
                 break
 
+        # End VLA recording for this episode
+        if vla_recorder is not None:
+            vla_recorder.end_episode(success=done, total_reward=episode_reward, num_attempts=episode_steps)
+
         if recorder is not None:
             if done:
                 recorder.commit()
@@ -522,16 +626,49 @@ def collect_place(args, dataset, record_dir):
 def main():
     args = parse_args()
     record_dir = None if args.no_record else args.record_dir
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = device
+    # Set task_num for model compatibility
+    args.task_num = 2 if args.task_emb else None
 
     dataset = CLIPActionDataset()
 
-    collect_grasp(args, dataset, record_dir)
-    collect_place(args, dataset, record_dir)
+    # Initialize VLA recorder if requested
+    vla_recorder = None
+    if args.record_vla:
+        from helpers.vla_recorder import VLARecorder
+        cameras = [c.strip() for c in args.vla_cameras.split(',')]
+        vla_recorder = VLARecorder(
+            output_dir=args.vla_output,
+            repo_id=args.vla_repo_id,
+            fps=args.vla_fps,
+            image_size=tuple(args.vla_image_size),
+            cameras=cameras,
+        )
+
+    # Load trained model if requested
+    trained_agent = None
+    if args.load_model:
+        from models.bc_agent import ViLGP3D
+        from helpers.logger import Logger
+
+        print(f"Loading trained model from {args.model_path}")
+        trained_agent = ViLGP3D(action_dim=7, args=args)
+        logger = Logger(suffix=args.log_suffix)
+        logger.load_sl_checkpoint(trained_agent.vilg3d, args.model_path, evaluate=True)
+
+    collect_grasp(args, dataset, record_dir, vla_recorder=vla_recorder, trained_agent=trained_agent)
+    collect_place(args, dataset, record_dir, vla_recorder=vla_recorder, trained_agent=trained_agent)
 
     output_dir = os.path.dirname(args.output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     np.save(args.output_path, dataset.data)
+
+    # Finalize VLA recording
+    if vla_recorder is not None:
+        vla_recorder.finalize()
+        print(f"VLA dataset saved to {args.vla_output}")
 
     if record_dir is not None:
         meta = {
