@@ -18,7 +18,7 @@ class VLARecorder:
     """
 
     # Available camera names
-    AVAILABLE_CAMERAS = ['front', 'left', 'right', 'top', 'side_left', 'side_right', 'overview']
+    AVAILABLE_CAMERAS = ['front', 'left', 'right', 'top', 'side_left', 'side_right', 'overview', 'gripper']
 
     def __init__(
         self,
@@ -249,8 +249,8 @@ class VLARecorder:
         """Cancel current episode without saving."""
         if self._episode_started:
             print(f"Cancelled episode {self._episode_count}")
-            # Clear the episode buffer without saving
-            self.dataset.episode_buffer = {}
+            # Clear the episode buffer without saving (set to None so add_frame creates new one)
+            self.dataset.clear_episode_buffer()
             self._episode_started = False
             self.current_task = None
             self.current_action = None

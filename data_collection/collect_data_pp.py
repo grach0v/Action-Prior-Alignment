@@ -29,8 +29,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--seed", type=int, default=234, help="random seed")
-    parser.add_argument("--num_episode_grasp", type=int, default=5000)
-    parser.add_argument("--num_episode_place", type=int, default=5000)
+    parser.add_argument("--num_episode", type=int, default=None,
+                        help="Number of episodes for pick-and-place mode (overrides grasp/place counts)")
+    parser.add_argument("--num_episode_grasp", type=int, default=5000,
+                        help="Number of grasp episodes (used when not in pick_and_place mode)")
+    parser.add_argument("--num_episode_place", type=int, default=5000,
+                        help="Number of place episodes (used when not in pick_and_place mode)")
     parser.add_argument("--num_obj_grasp", type=int, default=15)
     parser.add_argument("--num_obj_place", type=int, default=8)
     parser.add_argument("--sample_num", type=int, default=500)
@@ -50,6 +54,8 @@ def parse_args():
                         help='Load trained model for action selection')
     parser.add_argument('--model_path', type=str, default='',
                         help='Path to trained model checkpoint')
+    parser.add_argument('--evaluate', action='store_true', default=True,
+                        help='Set model to evaluation mode (default: True for data collection)')
 
     # Transformer model parameters (required when loading model)
     parser.add_argument('--ratio', type=float, default=0.2)
@@ -77,12 +83,19 @@ def parse_args():
     parser.add_argument('--vla_repo_id', type=str, default='local/pp_vla',
                         help='Repository ID for LeRobot dataset')
     parser.add_argument('--vla_fps', type=int, default=30,
-                        help='Recording FPS for VLA data')
+                        help='Recording FPS for VLA data (default: 30)')
     parser.add_argument('--vla_image_size', type=int, nargs=2, default=[480, 640],
                         metavar=('HEIGHT', 'WIDTH'),
-                        help='Image size for VLA recording (default: 480 640)')
+                        help='Image size stored in dataset (default: 480 640)')
+    parser.add_argument('--vla_render_size', type=int, nargs=2, default=[480, 640],
+                        metavar=('HEIGHT', 'WIDTH'),
+                        help='Render size (default: 480 640, needs GPU for 30 FPS)')
     parser.add_argument('--vla_cameras', type=str, default='front,overview',
-                        help='Comma-separated cameras: front,left,right,top,side_left,side_right,overview (default: front,overview)')
+                        help='Comma-separated cameras: front,left,right,top,side_left,side_right,overview,gripper (default: front,overview)')
+
+    # Pick-and-place mode (combined grasp + place in one episode)
+    parser.add_argument('--pick_and_place', action='store_true', default=False,
+                        help='Record full pick-and-place episodes (grasp + place combined)')
 
     return parser.parse_args()
 
@@ -196,7 +209,8 @@ def collect_grasp(args, dataset, record_dir, vla_recorder=None, trained_agent=No
     # Set up VLA recording if provided
     if vla_recorder is not None:
         cameras = [c.strip() for c in args.vla_cameras.split(',')]
-        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras)
+        render_size = tuple(args.vla_render_size) if args.vla_render_size else None
+        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras, render_size=render_size)
 
     extrinsics, intrinsics = utils.get_camera_configs(env)
     logger.save_camera_configs(extrinsics, intrinsics)
@@ -374,6 +388,251 @@ def collect_grasp(args, dataset, record_dir, vla_recorder=None, trained_agent=No
         )
 
 
+def collect_pick_and_place(args, dataset, record_dir, vla_recorder=None, trained_agent=None):
+    """Collect full pick-and-place episodes (grasp + place in one episode)."""
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    env = Environment(gui=False)
+    env.seed(args.seed)
+    logger = Logger(suffix=f"{args.log_suffix}-pp")
+    graspnet = Graspnet()
+    placenet = Placenet()
+    field_builder = FeatureField(
+        num_cam=3,
+        query_threshold=[0.4],
+        grid_size=0.004,
+        boundaries=WORKSPACE_LIMITS,
+        feat_backbone=args.feat_backbone,
+        device=device,
+    )
+
+    # Set up VLA recording if provided
+    if vla_recorder is not None:
+        cameras = [c.strip() for c in args.vla_cameras.split(',')]
+        render_size = tuple(args.vla_render_size) if args.vla_render_size else None
+        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras, render_size=render_size)
+
+    extrinsics, intrinsics = utils.get_camera_configs(env)
+    logger.save_camera_configs(extrinsics, intrinsics)
+    save_camera_configs(record_dir, extrinsics, intrinsics)
+
+    iteration = 0
+    # Use --num_episode if specified, otherwise fall back to --num_episode_place
+    num_episodes = args.num_episode if args.num_episode is not None else args.num_episode_place
+
+    for episode in range(num_episodes):
+        episode_reward = 0
+        episode_steps = 0
+        done = False
+        reset = False
+
+        while not reset:
+            env.reset()
+            if episode < 400:
+                warmup_num_obj = 5
+                _, reset = env.add_objects_for_place(warmup_num_obj, WORKSPACE_LIMITS)
+            else:
+                _, reset = env.add_objects_for_place(args.num_obj_place, WORKSPACE_LIMITS)
+
+        recorder = None
+
+        while not done:
+            # Remove objects out of workspace
+            for obj_id in env.obj_ids["rigid"]:
+                pos, _, _ = env.obj_info(obj_id)
+                if (
+                    pos[0] < WORKSPACE_LIMITS[0][0]
+                    or pos[0] > WORKSPACE_LIMITS[0][1]
+                    or pos[1] < WORKSPACE_LIMITS[1][0]
+                    or pos[1] > WORKSPACE_LIMITS[1][1]
+                ):
+                    print("\033[031m Delete objects out of workspace!\033[0m")
+                    env.remove_object_id(obj_id)
+
+            color_images, depth_images, pcd = utils.get_multi_view_images_w_pointcloud(
+                env, visualize=args.visualize
+            )
+
+            color_heightmap, depth_heightmap, mask_heightmap = utils.get_true_heightmap(env)
+            bbox_ids, bbox_images, bbox_sizes, bbox_centers, bbox_positions = utils.get_true_bboxes(
+                env, color_heightmap, depth_heightmap, mask_heightmap
+            )
+            bbox_ids, remain_bbox_images, bbox_sizes, bbox_centers, bbox_positions = (
+                utils.preprocess_bboxes(
+                    bbox_ids, bbox_images, bbox_sizes, bbox_centers, bbox_positions
+                )
+            )
+
+            if len(remain_bbox_images) != len(bbox_images):
+                print("\033[031m Bad detection of the scene!\033[0m")
+                break
+            if len(env.obj_labels) == 0:
+                print("\033[031m No labeled objects in the scene!\033[0m")
+                break
+
+            lang_goal, ref_obj_ids, ref_obj_centers, ref_regions, valid_mask = (
+                env.generate_place_lang_goal(bbox_ids, bbox_centers, bbox_sizes)
+            )
+            if lang_goal is None:
+                print("\033[031m Nonvalid scene!\033[0m")
+                break
+            print(
+                f"\033[032m Episode {episode}, language goal: {lang_goal}\033[0m"
+            )
+
+            if recorder is None and record_dir is not None:
+                recorder = EpisodeRecorder(record_dir, "pick_and_place", episode, lang_goal)
+
+            # Start VLA recording for this episode
+            if vla_recorder is not None:
+                env.reset_recording_state()
+                vla_recorder.start_episode(task=lang_goal)
+
+            # Check reference objects in workspace
+            out_of_workspace = []
+            for obj_id in env.reference_obj_ids:
+                pos, _, _ = env.obj_info(obj_id)
+                if (
+                    pos[0] < WORKSPACE_LIMITS[0][0]
+                    or pos[0] > WORKSPACE_LIMITS[0][1]
+                    or pos[1] < WORKSPACE_LIMITS[1][0]
+                    or pos[1] > WORKSPACE_LIMITS[1][1]
+                ):
+                    out_of_workspace.append(obj_id)
+
+            if len(env.reference_obj_ids) > 0 and len(out_of_workspace) == len(env.reference_obj_ids):
+                print("\033[031m Reference objects are not in the scene!\033[0m")
+                if vla_recorder is not None:
+                    vla_recorder.cancel_episode()
+                break
+
+            # Generate grasp poses using graspnet
+            with torch.no_grad():
+                grasp_pose_set, grasp_pose_dict, _ = graspnet.grasp_detection(
+                    pcd, env.get_true_object_poses(), visualize=args.visualize
+                )
+
+            if len(grasp_pose_set) == 0:
+                print("\033[033m No valid grasps found, skipping episode\033[0m")
+                if vla_recorder is not None:
+                    vla_recorder.cancel_episode()
+                break
+
+            # Filter grasps to exclude reference objects
+            valid_grasps = []
+            ref_positions = []
+            for ref_id in getattr(env, 'reference_obj_ids', []):
+                pos, _, _ = env.obj_info(ref_id)
+                ref_positions.append(np.array(pos[:2]))
+
+            for grasp in grasp_pose_set:
+                grasp_xy = grasp[:2]
+                is_valid = True
+                for ref_pos in ref_positions:
+                    if np.linalg.norm(grasp_xy - ref_pos) < 0.05:
+                        is_valid = False
+                        break
+                if is_valid:
+                    valid_grasps.append(grasp)
+
+            if len(valid_grasps) == 0:
+                print("\033[033m No valid grasps (all near reference), skipping\033[0m")
+                if vla_recorder is not None:
+                    vla_recorder.cancel_episode()
+                break
+
+            # Generate place poses
+            all_place_valid_mask = utils.generate_all_place_dist(
+                ref_obj_ids[0],
+                env.obj_labels[ref_obj_ids[0]][0],
+                ref_regions[0],
+                valid_mask,
+                env.obj_labels,
+                bbox_ids,
+                bbox_centers,
+                bbox_sizes,
+            )
+            place_pixels, place_pose_set, _, valid_places_list = (
+                placenet.place_generation_return_gt(
+                    depth_heightmap,
+                    bbox_centers,
+                    bbox_sizes,
+                    ref_obj_centers,
+                    ref_regions,
+                    all_place_valid_mask,
+                    grasped_obj_size=None,
+                    sample_num_each_object=3,
+                    topdown_place_rot=True,
+                )
+            )
+
+            if len(valid_places_list) == 0:
+                print("\033[031m No valid place positions!\033[0m")
+                if vla_recorder is not None:
+                    vla_recorder.cancel_episode()
+                break
+
+            # Select place action
+            action_idx = np.random.choice(valid_places_list, size=1)[0]
+            place_action = place_pose_set[action_idx]
+
+            # Set action for VLA recording
+            if vla_recorder is not None:
+                vla_recorder.set_action(place_action, attempt_idx=episode_steps)
+
+            # Execute pick-and-place with multiple grasp attempts
+            np.random.shuffle(valid_grasps)
+            success = False
+            for grasp_idx, grasp_pose in enumerate(valid_grasps[:5]):
+                print(f"  Trying grasp {grasp_idx+1}/{min(5, len(valid_grasps))}")
+                reward, success = env.step_place(place_action, grasp_pose=grasp_pose)
+
+                if reward is not None and success is not None:
+                    break
+
+            if not success:
+                print("\033[033m All grasp attempts failed\033[0m")
+                if vla_recorder is not None:
+                    vla_recorder.cancel_episode()
+                break
+
+            # Update step result
+            if vla_recorder is not None:
+                vla_recorder.update_step_result(reward=reward, success=success)
+
+            episode_steps += 1
+            iteration += 1
+            episode_reward += reward if reward else 0
+
+            if recorder is not None:
+                robot_state = get_robot_state(env)
+                recorder.save_step(
+                    color_images, depth_images, robot_state, place_action, action_idx
+                )
+
+            done = True
+            break
+
+        # End VLA recording
+        if vla_recorder is not None and done:
+            vla_recorder.end_episode(success=success, total_reward=episode_reward, num_attempts=episode_steps)
+
+        if recorder is not None:
+            if done:
+                recorder.commit()
+            else:
+                recorder.discard()
+
+        logger.episode_success_logs.append(done)
+        logger.write_to_log("episode_success", logger.episode_success_logs)
+        print(
+            "\033[034m Episode: {}, total numsteps: {}, episode steps: {}, reward: {}, success: {}\033[0m".format(
+                episode, iteration, episode_steps, round(episode_reward, 2), done
+            )
+        )
+
+
 def collect_place(args, dataset, record_dir, vla_recorder=None, trained_agent=None):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -398,7 +657,8 @@ def collect_place(args, dataset, record_dir, vla_recorder=None, trained_agent=No
     # Set up VLA recording if provided
     if vla_recorder is not None:
         cameras = [c.strip() for c in args.vla_cameras.split(',')]
-        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras)
+        render_size = tuple(args.vla_render_size) if args.vla_render_size else None
+        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras, render_size=render_size)
 
     extrinsics, intrinsics = utils.get_camera_configs(env)
     logger.save_camera_configs(extrinsics, intrinsics)
@@ -657,8 +917,13 @@ def main():
         logger = Logger(suffix=args.log_suffix)
         logger.load_sl_checkpoint(trained_agent.vilg3d, args.model_path, evaluate=True)
 
-    collect_grasp(args, dataset, record_dir, vla_recorder=vla_recorder, trained_agent=trained_agent)
-    collect_place(args, dataset, record_dir, vla_recorder=vla_recorder, trained_agent=trained_agent)
+    if args.pick_and_place:
+        # Full pick-and-place episodes (grasp + place combined)
+        collect_pick_and_place(args, dataset, record_dir, vla_recorder=vla_recorder, trained_agent=trained_agent)
+    else:
+        # Separate grasp and place data collection
+        collect_grasp(args, dataset, record_dir, vla_recorder=vla_recorder, trained_agent=trained_agent)
+        collect_place(args, dataset, record_dir, vla_recorder=vla_recorder, trained_agent=trained_agent)
 
     output_dir = os.path.dirname(args.output_path)
     if output_dir:

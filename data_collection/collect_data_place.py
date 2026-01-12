@@ -16,6 +16,7 @@ from env.constants import WORKSPACE_LIMITS
 from env.environment_sim import Environment
 from helpers.logger import Logger
 from action_generator.place_generator import Placenet
+from action_generator.grasp_detetor import Graspnet
 from feature_extractor.feature_field_builder import FeatureField
 from helpers.dataset import CLIPActionDataset
 
@@ -70,10 +71,13 @@ def parse_args():
     parser.add_argument('--vla_repo_id', type=str, default='local/place_vla',
                         help='Repository ID for LeRobot dataset')
     parser.add_argument('--vla_fps', type=int, default=30,
-                        help='Recording FPS for VLA data')
+                        help='Recording FPS for VLA data (default: 30)')
     parser.add_argument('--vla_image_size', type=int, nargs=2, default=[480, 640],
                         metavar=('HEIGHT', 'WIDTH'),
-                        help='Image size for VLA recording (default: 480 640)')
+                        help='Image size stored in dataset (default: 480 640)')
+    parser.add_argument('--vla_render_size', type=int, nargs=2, default=[480, 640],
+                        metavar=('HEIGHT', 'WIDTH'),
+                        help='Render size (default: 480 640, needs GPU for 30 FPS)')
     parser.add_argument('--vla_cameras', type=str, default='front,overview',
                         help='Comma-separated cameras: front,left,right,top,side_left,side_right,overview (default: front,overview)')
 
@@ -105,6 +109,8 @@ if __name__ == "__main__":
     logger = Logger(suffix=args.log_suffix)
     # load placenet
     placenet = Placenet()
+    # load graspnet for VLA recording (to get valid grasps before placing)
+    graspnet = Graspnet()
     # load feature field builer
     field_builer = FeatureField(num_cam=3, query_threshold=[0.4], grid_size=0.004, boundaries=WORKSPACE_LIMITS, feat_backbone=args.feat_backbone, device=args.device)
 
@@ -125,7 +131,8 @@ if __name__ == "__main__":
             image_size=tuple(args.vla_image_size),
             cameras=cameras,
         )
-        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras)
+        render_size = tuple(args.vla_render_size) if args.vla_render_size else None
+        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras, render_size=render_size)
 
     iteration = 0
     updates = 0
@@ -181,6 +188,7 @@ if __name__ == "__main__":
 
             # Start VLA recording for this episode (after lang_goal is known)
             if vla_recorder is not None:
+                env.reset_recording_state()  # Reset frame limits for new episode
                 vla_recorder.start_episode(task=lang_goal)
 
             # check if one of the target objects is in the workspace:
@@ -203,7 +211,8 @@ if __name__ == "__main__":
             # placenet, generate all feasible places
             all_place_valid_mask = utils.generate_all_place_dist(ref_obj_ids[0], env.obj_labels[ref_obj_ids[0]][0], ref_regions[0], valid_mask, env.obj_labels, bbox_ids, bbox_centers, bbox_sizes)
             # place_pixels, place_pose_set, _, valid_places_list = placenet.place_generation_return_gt(depth_heightmap, bbox_centers, bbox_sizes, ref_obj_centers, ref_regions, all_place_valid_mask, grasped_obj_size=None)
-            place_pixels, place_pose_set, _, valid_places_list = placenet.place_generation_return_gt(depth_heightmap, bbox_centers, bbox_sizes, ref_obj_centers, ref_regions, all_place_valid_mask, grasped_obj_size=None, sample_num_each_object=3)
+            # topdown_place_rot=True gives correct gripper orientation for placing
+            place_pixels, place_pose_set, _, valid_places_list = placenet.place_generation_return_gt(depth_heightmap, bbox_centers, bbox_sizes, ref_obj_centers, ref_regions, all_place_valid_mask, grasped_obj_size=None, sample_num_each_object=3, topdown_place_rot=True)
 
             if len(valid_places_list) == 0:
                 print("\033[031m Nonvalid place in the scene!\033[0m")
@@ -233,28 +242,83 @@ if __name__ == "__main__":
             if vla_recorder is not None:
                 vla_recorder.set_action(action, attempt_idx=episode_steps)
 
-            # reward, done = env.step(action)
-            reward = 2
-            done = True
+            # Execute action (required for VLA recording, optional otherwise)
+            if vla_recorder is not None:
+                # Generate grasp poses using graspnet for reliable grasping
+                with torch.no_grad():
+                    grasp_pose_set, grasp_pose_dict, _ = graspnet.grasp_detection(
+                        pcd, env.get_true_object_poses(), visualize=args.visualize
+                    )
+
+                if len(grasp_pose_set) == 0:
+                    print("\033[033m No valid grasps found, skipping episode\033[0m")
+                    vla_recorder.cancel_episode()
+                    break
+
+                # Filter grasps to exclude reference objects (we don't want to grasp the target)
+                valid_grasps = []
+                ref_positions = []
+                for ref_id in getattr(env, 'reference_obj_ids', []):
+                    pos, _, _ = env.obj_info(ref_id)
+                    ref_positions.append(np.array(pos[:2]))
+
+                for grasp in grasp_pose_set:
+                    grasp_xy = grasp[:2]
+                    # Check if grasp is not too close to reference objects
+                    is_valid = True
+                    for ref_pos in ref_positions:
+                        if np.linalg.norm(grasp_xy - ref_pos) < 0.05:  # 5cm threshold
+                            is_valid = False
+                            break
+                    if is_valid:
+                        valid_grasps.append(grasp)
+
+                if len(valid_grasps) == 0:
+                    print("\033[033m No valid grasps (all near reference), skipping episode\033[0m")
+                    vla_recorder.cancel_episode()
+                    break
+
+                # Try multiple graspnet poses until one works
+                np.random.shuffle(valid_grasps)
+                grasp_succeeded = False
+                for grasp_idx, grasp_pose in enumerate(valid_grasps[:5]):  # Try up to 5 grasps
+                    print(f"  Trying graspnet pose {grasp_idx+1}/{min(5, len(valid_grasps))} (from {len(valid_grasps)} valid)")
+                    reward, success = env.step_place(action, grasp_pose=grasp_pose)
+
+                    if reward is not None and success is not None:
+                        grasp_succeeded = True
+                        break
+                    # Grasp failed, try next one (step_place already resets gripper)
+
+                if not grasp_succeeded:
+                    print("\033[033m All grasp attempts failed, skipping episode for VLA\033[0m")
+                    vla_recorder.cancel_episode()
+                    break
+            else:
+                # Skip execution for faster data collection when not recording VLA
+                reward = 2
+                success = True
 
             # Update step result for VLA recording
             if vla_recorder is not None:
-                vla_recorder.update_step_result(reward=reward, success=done)
+                vla_recorder.update_step_result(reward=reward, success=success)
 
             episode_steps += 1
             iteration += 1
             # episode_reward += reward
-            print("\033[034m Episode: {}, total numsteps: {}\033[0m".format(episode, iteration, done))
+            print("\033[034m Episode: {}, total numsteps: {}, success: {}\033[0m".format(episode, iteration, success))
 
             # data collection
             # for unified
-            data.add(episode, episode_steps, lang_goal, sampled_pts.detach().cpu().numpy()[0], sampled_clip_feats.detach().cpu().numpy()[0], sampled_clip_sims.detach().cpu().numpy()[0], places.detach().cpu().numpy()[0], action_idx, reward, done)
+            data.add(episode, episode_steps, lang_goal, sampled_pts.detach().cpu().numpy()[0], sampled_clip_feats.detach().cpu().numpy()[0], sampled_clip_sims.detach().cpu().numpy()[0], places.detach().cpu().numpy()[0], action_idx, reward, success)
 
-            if done: break
+            # Always end after one attempt for place
+            done = True
+            break
 
         # End VLA recording for this episode
-        if vla_recorder is not None:
-            vla_recorder.end_episode(success=done, total_reward=episode_reward, num_attempts=episode_steps)
+        if vla_recorder is not None and 'success' in dir() and success is not None:
+            vla_recorder.end_episode(success=success, total_reward=episode_reward, num_attempts=episode_steps)
 
         if (episode + 1) % 5000 == 0:
             timestamp = time.time()

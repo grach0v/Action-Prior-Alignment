@@ -74,10 +74,13 @@ def parse_args():
     parser.add_argument('--vla_repo_id', type=str, default='local/grasp_vla',
                         help='Repository ID for LeRobot dataset')
     parser.add_argument('--vla_fps', type=int, default=30,
-                        help='Recording FPS for VLA data')
+                        help='Recording FPS for VLA data (default: 30)')
     parser.add_argument('--vla_image_size', type=int, nargs=2, default=[480, 640],
                         metavar=('HEIGHT', 'WIDTH'),
-                        help='Image size for VLA recording (default: 480 640)')
+                        help='Image size stored in dataset (default: 480 640)')
+    parser.add_argument('--vla_render_size', type=int, nargs=2, default=[480, 640],
+                        metavar=('HEIGHT', 'WIDTH'),
+                        help='Render size (default: 480 640, needs GPU for 30 FPS)')
     parser.add_argument('--vla_cameras', type=str, default='front,overview',
                         help='Comma-separated cameras: front,left,right,top,side_left,side_right,overview (default: front,overview)')
 
@@ -144,7 +147,8 @@ if __name__ == "__main__":
             image_size=tuple(args.vla_image_size),
             cameras=cameras,
         )
-        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras)
+        render_size = tuple(args.vla_render_size) if args.vla_render_size else None
+        env.set_frame_recorder(vla_recorder.record_frame, fps=args.vla_fps, cameras=cameras, render_size=render_size)
 
     iteration = 0
     updates = 0

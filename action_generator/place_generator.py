@@ -80,7 +80,8 @@ class Placenet:
             place_points = np.float32([pos_x, pos_y, pos_z]).transpose(1, 0)
         
             if topdown_place_rot:
-                place_poses = np.concatenate((place_points, np.array([[0.707, 0, -0.707, 0]]).repeat(place_points.shape[0], axis=0)), axis=1)
+                # [1,0,0,0] quaternion keeps XY unchanged and applies Z offset correctly
+                place_poses = np.concatenate((place_points, np.array([[1, 0, 0, 0]]).repeat(place_points.shape[0], axis=0)), axis=1)
             else:
                 place_poses = np.concatenate((place_points, np.array([[0, 0, 0, 1]]).repeat(place_points.shape[0], axis=0)), axis=1)
 

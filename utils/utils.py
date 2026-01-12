@@ -665,11 +665,11 @@ def rotate(image, angle, is_mask=False):
 
     return rotated
 
-def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sample_grasp=False, sample_place=False, downsample_interval=10, visualize=False):    
-    pts = torch.from_numpy(pts)
+def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sample_grasp=False, sample_place=False, downsample_interval=10, visualize=False):
     clip_feats = feat_dict['clip_feats']
     device = clip_feats.device
     clip_sims = feat_dict['clip_sims'][..., 0]
+    pts = torch.from_numpy(pts).to(device)
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
     sample_indices = torch.argsort(clip_sims, descending=True)[:sample_num]

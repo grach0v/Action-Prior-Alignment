@@ -1,3 +1,7 @@
+import os
+# Enable EGL for headless GPU rendering (must be set before pybullet import)
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+
 import time
 import datetime
 import glob
@@ -6,7 +10,6 @@ import pybullet_data
 from pybullet_utils import bullet_client
 import numpy as np
 import trimesh
-import os
 from operator import itemgetter
 from scipy.spatial.transform import Rotation as R
 import utils.utils as utils
@@ -50,6 +53,16 @@ class Environment:
         pb.setAdditionalSearchPath(pybullet_data.getDataPath())
         pb.setTimeStep(time_step)
 
+        # Load EGL plugin for GPU rendering in headless mode
+        self._egl_plugin = -1
+        if not gui:
+            egl_path = os.path.join(os.path.dirname(pb.__file__),
+                                    'eglRenderer.cpython-310-x86_64-linux-gnu.so')
+            if os.path.exists(egl_path):
+                self._egl_plugin = pb.loadPlugin(egl_path, '_eglRendererPlugin')
+                if self._egl_plugin >= 0:
+                    print(f"GPU rendering enabled via EGL (plugin {self._egl_plugin})")
+
         if gui:
             target = pb.getDebugVisualizerCamera()[11]
             pb.resetDebugVisualizerCamera(
@@ -63,6 +76,10 @@ class Environment:
         self._steps_per_frame = int((1 / time_step) / 30)  # Default: 240/30 = 8
         self._step_counter = 0
         self._current_action = None
+        self._recorded_frame_count = 0  # Total frames in current episode
+        self._max_frames_per_episode = 500  # ~17 sec at 30fps, enough for one place action
+        self._baseline_joints = None  # For progress detection
+        self._no_progress_count = 0  # Frames without significant progress
             
 
     @property
@@ -96,7 +113,43 @@ class Environment:
         )
         dim = pb.getVisualShapeData(obj_id, physicsClientId=self._client_id)[0][3]
         info = (pos, rot, dim)
-        return info    
+        return info
+
+    def _load_texture_for_object(self, body_id, mesh_file):
+        """Load and apply texture for an object from its URDF path.
+
+        Args:
+            body_id: PyBullet body ID of the loaded object
+            mesh_file: Path to the URDF file (e.g., 'assets/simplified_objects/003.urdf')
+        """
+        # Extract the object directory from URDF path
+        # e.g., 'assets/simplified_objects/003.urdf' -> 'assets/simplified_objects/003'
+        obj_dir = mesh_file.replace('.urdf', '')
+
+        # Check for texture files (PNG only - JPGs were converted)
+        texture_candidates = [
+            os.path.join(obj_dir, 'texture_map.png'),
+            os.path.join(obj_dir, 'textured.png'),
+        ]
+
+        texture_path = None
+        for candidate in texture_candidates:
+            if os.path.exists(candidate):
+                texture_path = candidate
+                break
+
+        if texture_path is not None:
+            try:
+                texture_id = pb.loadTexture(texture_path, physicsClientId=self._client_id)
+                if texture_id >= 0:
+                    # Apply texture to all visual shapes (link -1 is the base)
+                    pb.changeVisualShape(
+                        body_id, -1,
+                        textureUniqueId=texture_id,
+                        physicsClientId=self._client_id
+                    )
+            except Exception as e:
+                print(f"Warning: Failed to load texture {texture_path}: {e}")
 
     def generate_lang_goal(self):
         
@@ -452,13 +505,121 @@ class Environment:
 
         return reward, done
 
+    def step_place(self, place_pose, grasp_pose=None):
+        """Execute grasp-then-place for VLA recording.
+
+        For realistic VLA training: grasps object WITHOUT recording,
+        then records only the place motion.
+
+        Args:
+            place_pose: SE(3) place pose (7D: xyz + quaternion).
+            grasp_pose: SE(3) grasp pose (7D) from graspnet. If None, uses simple top-down.
+
+        Returns:
+            reward, done: Returns (2, True) for success, (0, False) for failure.
+            Returns (None, None) if grasp failed (caller should skip this episode).
+        """
+        # Pick objects to try grasping (excluding reference objects)
+        graspable_ids = [oid for oid in self.obj_ids["rigid"]
+                       if oid not in getattr(self, 'reference_obj_ids', [])]
+        if not graspable_ids:
+            print("Warning: No graspable objects available")
+            return None, None  # Signal to skip episode
+
+        # DISABLE recording during grasp phase
+        saved_recorder = self._frame_recorder
+        self._frame_recorder = None
+
+        # Save original target_obj_ids
+        original_target_ids = self.target_obj_ids
+
+        grasp_success = False
+        grasped_obj_id = None
+
+        if grasp_pose is not None:
+            # Use graspnet-provided pose directly (much more reliable)
+            # Set target to all graspable objects for detection
+            self.target_obj_ids = graspable_ids
+            # follow_place=True keeps object in gripper, detect_force=False avoids false collisions
+            grasp_success, grasped_obj_id, _ = self.grasp(grasp_pose, follow_place=True, detect_force=False)
+            if grasp_success and grasped_obj_id is not None:
+                print(f"Successfully grasped object {grasped_obj_id} using graspnet pose")
+        else:
+            # Fallback: simple top-down grasp, try different objects
+            np.random.shuffle(graspable_ids)
+            for obj_id in graspable_ids[:5]:  # Try up to 5 objects
+                obj_pos, obj_rot, obj_dim = self.obj_info(obj_id)
+
+                # Set this as target for grasp() method compatibility
+                self.target_obj_ids = [obj_id]
+
+                # Simple top-down grasp targeting object center
+                grasp_quat = np.array([1.0, 0.0, 0.0, 0.0])  # Top-down orientation
+                aabb_min, aabb_max = pb.getAABB(obj_id, physicsClientId=self._client_id)
+                obj_center_z = (aabb_min[2] + aabb_max[2]) / 2
+                grasp_z = obj_center_z + 0.02
+                grasp_pos = np.array([obj_pos[0], obj_pos[1], grasp_z])
+                simple_grasp_pose = np.concatenate([grasp_pos, grasp_quat])
+                print(f"  Trying object {obj_id}: aabb_z={aabb_min[2]:.3f}-{aabb_max[2]:.3f}, grasp_z={grasp_z:.3f}")
+                # follow_place=True keeps object in gripper for subsequent place
+                grasp_success, grasped_obj_id, _ = self.grasp(simple_grasp_pose, follow_place=True, detect_force=False)
+
+                if grasp_success and grasped_obj_id is not None:
+                    print(f"Successfully grasped object {grasped_obj_id}")
+                    break
+
+                # Reset for next attempt
+                self.open_gripper()
+                self.go_home()
+
+        # Restore original target_obj_ids
+        self.target_obj_ids = original_target_ids
+
+        if not grasp_success or grasped_obj_id is None:
+            print("Warning: Grasp failed, skipping this episode")
+            self._frame_recorder = saved_recorder  # Restore recorder
+            self.go_home()
+            return None, None  # Signal to skip episode
+
+        print(f"Grasped object {grasped_obj_id}, now recording place...")
+
+        # RE-ENABLE recording for place phase
+        self._frame_recorder = saved_recorder
+        self.reset_recording_state()  # Reset frame counters for place recording
+
+        # Step 2: Place the grasped object (this is recorded)
+        place_success = self.place(place_pose)
+
+        # Verify object actually reached target (not slipped)
+        if place_success and grasped_obj_id is not None:
+            # Wait for physics to settle
+            for _ in range(50):
+                pb.stepSimulation(physicsClientId=self._client_id)
+
+            # Check if object is near target place position
+            target_xy = place_pose[:2]
+            obj_pos, _, _ = self.obj_info(grasped_obj_id)
+            obj_xy = np.array(obj_pos[:2])
+            distance = np.linalg.norm(obj_xy - target_xy)
+
+            # Success if object is within 5cm of target
+            actual_success = distance < 0.05
+            print(f"  Place verification: obj at {obj_xy}, target at {target_xy}, dist={distance:.3f}m, success={actual_success}")
+
+            if actual_success:
+                return 2, True
+            else:
+                return 0, False
+        else:
+            return 0, False
+
     def seed(self, seed=None):
         self._random = np.random.RandomState(seed)
         return seed
 
     # ========== VLA Frame Recording Methods ==========
 
-    def set_frame_recorder(self, recorder_callback, fps=30, cameras=None):
+    def set_frame_recorder(self, recorder_callback, fps=30, cameras=None, render_size=None):
         """Set callback for VLA frame recording during robot movements.
 
         Args:
@@ -466,20 +627,34 @@ class Environment:
             fps: Recording frames per second.
             cameras: List of camera names to record ['front', 'left', 'right'].
                     If None, all cameras are recorded.
+            render_size: Tuple (height, width) for fast rendering. None = native 720p.
+                        Recommended: (240, 320) for ~10 FPS, (224, 224) for ~13 FPS
         """
         self._frame_recorder = recorder_callback
         self._recording_fps = fps
         self._recording_cameras = cameras  # None means all cameras
+        self._recording_render_size = render_size  # For fast rendering
         self._steps_per_frame = max(1, int((1 / self.time_step) / fps))
         self._step_counter = 0
+        self._recorded_frame_count = 0  # Reset frame count
+        self._baseline_joints = None  # Reset progress detection
+        self._no_progress_count = 0
         cam_str = ', '.join(cameras) if cameras else 'all'
-        print(f"Frame recorder set: {fps} FPS, cameras: {cam_str}, record every {self._steps_per_frame} steps")
+        size_str = f"{render_size[1]}x{render_size[0]}" if render_size else "720p"
+        print(f"Frame recorder set: {fps} FPS, cameras: {cam_str}, render: {size_str}, every {self._steps_per_frame} steps")
 
     def clear_frame_recorder(self):
         """Clear the frame recorder callback."""
         self._frame_recorder = None
         self._current_action = None
         self._step_counter = 0
+
+    def reset_recording_state(self):
+        """Reset recording state for a new episode."""
+        self._step_counter = 0
+        self._recorded_frame_count = 0
+        self._baseline_joints = None
+        self._no_progress_count = 0
 
     def set_current_action(self, action):
         """Set the current action being executed (for recording context)."""
@@ -521,15 +696,110 @@ class Environment:
         'side_left': 4,  # new_left
         'side_right': 5, # new_right
         'overview': 6,   # overview - sees robot and scene
+        'gripper': -1,   # special: dynamic camera attached to gripper
     }
 
-    def get_camera_images(self, cameras=None):
+    def _get_gripper_camera_config(self):
+        """Get camera config for wrist-mounted camera.
+
+        Camera is mounted on wrist_3_link (right before end effector),
+        very close to the gripper. Looks down at the gripper tip and objects.
+        """
+        # Mount camera on wrist_3_link (link 5) - very close to gripper
+        wrist3_link_id = 5  # wrist_3_link
+        wrist3_pos, wrist3_quat = self.get_link_pose(self.ur5e, wrist3_link_id)
+        wrist3_rotm = np.array(pb.getMatrixFromQuaternion(wrist3_quat)).reshape(3, 3)
+
+        # Get gripper tip position for targeting
+        ee_tip_pos, _ = self.get_link_pose(self.ee, self.ee_tip_id)
+
+        # Local axes of wrist3 link
+        wrist3_x = wrist3_rotm @ np.array([1, 0, 0])
+        wrist3_y = wrist3_rotm @ np.array([0, 1, 0])
+        wrist3_z = wrist3_rotm @ np.array([0, 0, 1])
+
+        # Position camera: small offset to the side from wrist3
+        # This puts it very close to the gripper but not blocking
+        camera_pos = np.array(wrist3_pos) + 0.04 * wrist3_y + 0.02 * wrist3_z
+
+        # Target point: look at gripper tip and slightly below
+        target = np.array(ee_tip_pos)
+        target[2] -= 0.05  # Look 5cm below gripper tip to see objects
+
+        look_dir = target - camera_pos
+        look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-8)
+
+        # Use world up as reference
+        world_up = np.array([0, 0, 1])
+        if abs(np.dot(look_dir, world_up)) > 0.95:
+            # Looking nearly straight down, use wrist Y as up
+            world_up = wrist3_y
+
+        # Compute camera orientation (right-handed coordinate system)
+        right = np.cross(world_up, look_dir)
+        right = right / (np.linalg.norm(right) + 1e-8)
+        cam_up = np.cross(look_dir, right)
+        cam_up = cam_up / (np.linalg.norm(cam_up) + 1e-8)
+
+        # Build rotation matrix
+        rot_mat = np.column_stack([right, cam_up, look_dir])
+        camera_quat = R.from_matrix(rot_mat).as_quat()  # [x, y, z, w]
+
+        return {
+            "image_size": (480, 640),
+            "intrinsics": np.array([[280, 0, 320], [0, 280, 240], [0, 0, 1]]),  # Wide FOV
+            "position": tuple(camera_pos),
+            "rotation": tuple(camera_quat),
+            "zrange": (0.01, 2.0),
+            "noise": False,
+        }
+
+    def render_camera_fast(self, config, render_size):
+        """Render camera at lower resolution for speed.
+
+        Args:
+            config: Camera config dict with position, rotation, zrange
+            render_size: Tuple (height, width) for rendering
+
+        Returns:
+            color: RGB image as (H, W, 3) uint8 array
+        """
+        # Simplified rendering without depth/segmentation for speed
+        lookdir = np.float32([0, 0, 1]).reshape(3, 1)
+        updir = np.float32([0, -1, 0]).reshape(3, 1)
+        rotation = pb.getMatrixFromQuaternion(config["rotation"])
+        rotm = np.float32(rotation).reshape(3, 3)
+        lookdir = (rotm @ lookdir).reshape(-1)
+        updir = (rotm @ updir).reshape(-1)
+        lookat = config["position"] + lookdir
+        znear, zfar = config["zrange"]
+
+        viewm = pb.computeViewMatrix(config["position"], lookat, updir)
+        aspect = render_size[1] / render_size[0]
+        projm = pb.computeProjectionMatrixFOV(60, aspect, znear, zfar)
+
+        # Render without segmentation mask for speed
+        _, _, color, _, _ = pb.getCameraImage(
+            width=render_size[1],
+            height=render_size[0],
+            viewMatrix=viewm,
+            projectionMatrix=projm,
+            shadow=0,
+            flags=pb.ER_NO_SEGMENTATION_MASK,
+            renderer=pb.ER_BULLET_HARDWARE_OPENGL,
+        )
+
+        color = np.array(color, dtype=np.uint8).reshape(render_size[0], render_size[1], 4)
+        return color[:, :, :3]
+
+    def get_camera_images(self, cameras=None, render_size=None):
         """Get RGB images from RealSense cameras.
 
         Args:
             cameras: List of camera names to capture.
-                    Available: front, left, right, top, side_left, side_right, overview
+                    Available: front, left, right, top, side_left, side_right, overview, gripper
                     If None, captures front, left, right.
+            render_size: Optional (height, width) for fast low-res rendering.
 
         Returns:
             dict with camera_name: (H, W, 3) uint8 arrays
@@ -537,12 +807,29 @@ class Environment:
         images = {}
         default_cams = ['front', 'left', 'right']
         cam_names = cameras if cameras else default_cams
+
+        # Use recording render size if set and no explicit size given
+        if render_size is None:
+            render_size = getattr(self, '_recording_render_size', None)
+
         for name in cam_names:
             if name not in self.CAMERA_INDICES:
                 raise ValueError(f"Unknown camera '{name}'. Available: {list(self.CAMERA_INDICES.keys())}")
+
             i = self.CAMERA_INDICES[name]
-            config = self.agent_cams[i]
-            color, _, _ = self.render_camera(config)
+
+            # Special handling for gripper camera (dynamic position)
+            if name == 'gripper':
+                config = self._get_gripper_camera_config()
+            else:
+                config = self.agent_cams[i]
+
+            if render_size is not None:
+                # Fast low-res rendering
+                color = self.render_camera_fast(config, render_size)
+            else:
+                # Full quality rendering
+                color, _, _ = self.render_camera(config)
             images[name] = color
         return images
 
@@ -551,9 +838,35 @@ class Environment:
         if self._frame_recorder is None:
             return
 
+        # Hard limit on frames per episode
+        if self._recorded_frame_count >= self._max_frames_per_episode:
+            return
+
         self._step_counter += 1
         if self._step_counter >= self._steps_per_frame:
             self._step_counter = 0
+
+            # Get current joint positions for progress detection
+            current_joints = np.array([
+                pb.getJointState(self.ur5e, i, physicsClientId=self._client_id)[0]
+                for i in self.ur5e_joints
+            ])
+
+            # Check for progress: compare to baseline every 30 frames (~1 sec)
+            if self._baseline_joints is None:
+                self._baseline_joints = current_joints.copy()
+            else:
+                self._no_progress_count += 1
+                if self._no_progress_count >= 30:  # Check every ~1 sec
+                    joint_diff = np.max(np.abs(current_joints - self._baseline_joints))
+                    if joint_diff < 0.05:  # Less than 0.05 rad progress in 1 sec = stuck
+                        return  # Don't record, robot is stuck
+                    # Made progress, update baseline
+                    self._baseline_joints = current_joints.copy()
+                    self._no_progress_count = 0
+
+            self._recorded_frame_count += 1
+
             # Capture images (only requested cameras) and robot state
             images = self.get_camera_images(self._recording_cameras)
             robot_state = self.get_robot_state()
@@ -681,6 +994,7 @@ class Environment:
                 body_ids.append(body_id)
                 self.target_obj_ids.append(body_id)
                 self.add_object_id(body_id)
+                self._load_texture_for_object(body_id, target_mesh_file)
                 self.wait_static()
 
                 out_file.write(
@@ -721,6 +1035,7 @@ class Environment:
                 )
                 body_ids.append(body_id)
                 self.add_object_id(body_id)
+                self._load_texture_for_object(body_id, curr_mesh_file)
                 self.wait_static()
 
                 out_file.write(
@@ -783,6 +1098,7 @@ class Environment:
                 )
                 body_ids.append(body_id)
                 self.add_object_id(body_id)
+                self._load_texture_for_object(body_id, curr_mesh_file)
                 self.wait_static()
 
                 self.obj_dirs[body_id] = curr_dir_label
@@ -837,6 +1153,7 @@ class Environment:
             )
             body_ids.append(body_id)
             self.add_object_id(body_id)
+            self._load_texture_for_object(body_id, mesh_file)
             self.wait_static()
 
             self.obj_dirs[body_id] = dir_label
@@ -1271,8 +1588,8 @@ class Environment:
 
     def move_joints(self, target_joints, speed=0.01, timeout=3):
         """Move UR5e to target joint configuration."""
-        # Increase timeout when recording (camera rendering adds ~100ms per frame)
-        effective_timeout = timeout * 10 if self._frame_recorder is not None else timeout
+        # Increase timeout when recording (camera rendering adds ~50ms per frame at 640x480)
+        effective_timeout = timeout * 3 if self._frame_recorder is not None else timeout
         t0 = time.time()
         while (time.time() - t0) < effective_timeout:
             current_joints = np.array(
@@ -1412,11 +1729,14 @@ class Environment:
         return success
 
 
-    def grasp(self, pose, speed=0.005, follow_place=False):
+    def grasp(self, pose, speed=0.005, follow_place=False, detect_force=True):
         """Execute grasping primitive.
 
         Args:
             pose: SE(3) grasping pose.
+            speed: Movement speed.
+            follow_place: If True, don't go home after grasp (for grasp-then-place).
+            detect_force: If True, use force detection during descent.
 
         Returns:
             success: robot movement success if True.
@@ -1461,14 +1781,24 @@ class Environment:
         min_pos_dist = None
         self.open_gripper()
         success = self.move_joints(self.ik_rest_joints)
+        if not success:
+            print(f"  [Grasp DEBUG] move_joints(ik_rest) failed")
         if success:
             success = self.move_ee_pose((over, rot))
+            if not success:
+                print(f"  [Grasp DEBUG] move_ee_pose(over) failed, over={over}")
         if success:
-            success = self.straight_move(over, pos, rot, speed, detect_force=True)
+            success = self.straight_move(over, pos, rot, speed, detect_force=detect_force)
+            if not success:
+                print(f"  [Grasp DEBUG] straight_move(over->pos) failed, pos={pos}")
         if success:
             self.close_gripper()
+            gripper_angle = pb.getJointState(self.ee, self.gripper_main_joint, physicsClientId=self._client_id)[0]
+            print(f"  [Grasp DEBUG] gripper closed, angle={gripper_angle:.3f} (threshold={self.gripper_angle_close_threshold})")
             success = self.straight_move(pos, over, rot, speed)
             success &= self.is_gripper_closed
+            if not self.is_gripper_closed:
+                print(f"  [Grasp DEBUG] gripper not holding object (angle >= threshold)")
             
             if success: # get grasp object id
                 max_height = -0.0001
@@ -1603,8 +1933,8 @@ class Environment:
         return gripper_angle < self.gripper_angle_close_threshold
 
     def _move_gripper(self, target_angle, timeout=3, is_slow=False):
-        # Increase timeout when recording (camera rendering adds significant time)
-        effective_timeout = timeout * 10 if self._frame_recorder is not None else timeout
+        # Increase timeout when recording (camera rendering adds ~50ms per frame)
+        effective_timeout = timeout * 3 if self._frame_recorder is not None else timeout
         t0 = time.time()
         prev_angle = pb.getJointState(
             self.ee, self.gripper_main_joint, physicsClientId=self._client_id
