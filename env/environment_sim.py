@@ -130,6 +130,7 @@ class Environment:
         texture_candidates = [
             os.path.join(obj_dir, 'texture_map.png'),
             os.path.join(obj_dir, 'textured.png'),
+            os.path.join(obj_dir, 'dummy.png'),  # Some objects use this name
         ]
 
         texture_path = None
@@ -702,29 +703,28 @@ class Environment:
     def _get_gripper_camera_config(self):
         """Get camera config for wrist-mounted camera.
 
-        Camera is mounted on wrist_3_link (right before end effector),
-        very close to the gripper. Looks down at the gripper tip and objects.
+        Camera is mounted like a watch on the wrist - on the side of the
+        end effector link, looking sideways at the gripper tip and objects.
         """
-        # Mount camera on wrist_3_link (link 5) - very close to gripper
-        wrist3_link_id = 5  # wrist_3_link
-        wrist3_pos, wrist3_quat = self.get_link_pose(self.ur5e, wrist3_link_id)
-        wrist3_rotm = np.array(pb.getMatrixFromQuaternion(wrist3_quat)).reshape(3, 3)
+        # Get end effector pose (the "wrist" where gripper attaches)
+        ee_pos, ee_quat = self.get_link_pose(self.ur5e, self.ur5e_ee_id)
+        ee_rotm = np.array(pb.getMatrixFromQuaternion(ee_quat)).reshape(3, 3)
 
         # Get gripper tip position for targeting
         ee_tip_pos, _ = self.get_link_pose(self.ee, self.ee_tip_id)
 
-        # Local axes of wrist3 link
-        wrist3_x = wrist3_rotm @ np.array([1, 0, 0])
-        wrist3_y = wrist3_rotm @ np.array([0, 1, 0])
-        wrist3_z = wrist3_rotm @ np.array([0, 0, 1])
+        # Local axes of end effector
+        ee_x = ee_rotm @ np.array([1, 0, 0])  # Points sideways
+        ee_y = ee_rotm @ np.array([0, 1, 0])  # Points sideways (perpendicular)
+        ee_z = ee_rotm @ np.array([0, 0, 1])  # Points along gripper direction
 
-        # Position camera: small offset to the side from wrist3
-        # This puts it very close to the gripper but not blocking
-        camera_pos = np.array(wrist3_pos) + 0.04 * wrist3_y + 0.02 * wrist3_z
+        # Position camera on the SIDE of the wrist, like a watch
+        # Offset significantly to the side (ee_x or ee_y) to avoid blocking
+        camera_pos = np.array(ee_pos) + 0.08 * ee_x - 0.02 * ee_z
 
         # Target point: look at gripper tip and slightly below
         target = np.array(ee_tip_pos)
-        target[2] -= 0.05  # Look 5cm below gripper tip to see objects
+        target[2] -= 0.03  # Look slightly below gripper tip
 
         look_dir = target - camera_pos
         look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-8)
@@ -732,8 +732,8 @@ class Environment:
         # Use world up as reference
         world_up = np.array([0, 0, 1])
         if abs(np.dot(look_dir, world_up)) > 0.95:
-            # Looking nearly straight down, use wrist Y as up
-            world_up = wrist3_y
+            # Looking nearly straight down, use ee_x as up
+            world_up = ee_x
 
         # Compute camera orientation (right-handed coordinate system)
         right = np.cross(world_up, look_dir)
@@ -747,7 +747,7 @@ class Environment:
 
         return {
             "image_size": (480, 640),
-            "intrinsics": np.array([[280, 0, 320], [0, 280, 240], [0, 0, 1]]),  # Wide FOV
+            "intrinsics": np.array([[300, 0, 320], [0, 300, 240], [0, 0, 1]]),
             "position": tuple(camera_pos),
             "rotation": tuple(camera_quat),
             "zrange": (0.01, 2.0),
