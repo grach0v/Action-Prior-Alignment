@@ -126,11 +126,14 @@ class Environment:
         # e.g., 'assets/simplified_objects/003.urdf' -> 'assets/simplified_objects/003'
         obj_dir = mesh_file.replace('.urdf', '')
 
-        # Check for texture files (PNG only - JPGs were converted)
+        # Check for texture files (PNG and JPG formats)
         texture_candidates = [
             os.path.join(obj_dir, 'texture_map.png'),
             os.path.join(obj_dir, 'textured.png'),
-            os.path.join(obj_dir, 'dummy.png'),  # Some objects use this name
+            os.path.join(obj_dir, 'dummy.png'),
+            os.path.join(obj_dir, 'texture_map.jpg'),
+            os.path.join(obj_dir, 'textured.jpg'),
+            os.path.join(obj_dir, 'textured_map.jpg'),  # two_color_hammer uses this
         ]
 
         texture_path = None
