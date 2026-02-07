@@ -7,7 +7,7 @@ import torch
 import numpy as np
 
 class Logger:
-    def __init__(self, case_dir=None, case=None, suffix=None, resume_logger=None):
+    def __init__(self, case_dir=None, case=None, suffix=None, resume_logger=None, log_root=None):
         
         if resume_logger is None:
             # Create directory to save data
@@ -20,12 +20,16 @@ class Logger:
                 name = "test"
             else:
                 name = "train"
+            if log_root is None:
+                log_root = os.environ.get("A2_LOG_ROOT", "logs")
+            log_root = os.path.abspath(log_root)
+
             if suffix is not None:
                 self.base_directory = os.path.join(
-                    os.path.abspath("logs"), timestamp_value.strftime("%Y-%m-%d-%H-%M-%S") + "-" + name + "-" + suffix)
+                    log_root, timestamp_value.strftime("%Y-%m-%d-%H-%M-%S") + "-" + name + "-" + suffix)
             else:
                 self.base_directory = os.path.join(
-                    os.path.abspath("logs"), timestamp_value.strftime("%Y-%m-%d-%H-%M-%S") + "-" + name)
+                    log_root, timestamp_value.strftime("%Y-%m-%d-%H-%M-%S") + "-" + name)
                 
             print("Creating data logging session: %s" % (self.base_directory))
             

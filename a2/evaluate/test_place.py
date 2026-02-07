@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument('--load_model', dest='load_model', action='store_true', default=False)
     parser.add_argument('--model_path', action='store', type=str, default='')
     parser.add_argument('--log_suffix', action='store', type=str, default=None)
+    parser.add_argument('--log_root', action='store', type=str, default='logs')
 
     parser.add_argument('--single_view', dest='single_view', action='store_true', default=False)
     parser.add_argument('--diff_views', dest='diff_views', action='store_true', default=False)

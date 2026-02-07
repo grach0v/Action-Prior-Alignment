@@ -665,6 +665,17 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
     pts = torch.from_numpy(pts)
     clip_feats = feat_dict['clip_feats']
     clip_sims = feat_dict['clip_sims'][..., 0]
+    # Keep all tensors on one device for torch indexing on newer stacks.
+    if isinstance(clip_sims, torch.Tensor):
+        pts = pts.to(clip_sims.device)
+    if not isinstance(clip_feats, torch.Tensor):
+        clip_feats = torch.as_tensor(clip_feats, device=pts.device)
+    elif clip_feats.device != pts.device:
+        clip_feats = clip_feats.to(pts.device)
+    if not isinstance(clip_sims, torch.Tensor):
+        clip_sims = torch.as_tensor(clip_sims, device=pts.device)
+    elif clip_sims.device != pts.device:
+        clip_sims = clip_sims.to(pts.device)
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
     sample_indices = torch.argsort(clip_sims, descending=True)[:sample_num]
@@ -738,6 +749,17 @@ def preprocess_pp_unified(pts, feat_dict, action_set, sample_num, sample_action=
     pts = torch.from_numpy(pts)
     clip_feats = feat_dict['clip_feats']
     clip_sims = feat_dict['clip_sims'][..., 0]
+    # Keep all tensors on one device for torch indexing on newer stacks.
+    if isinstance(clip_sims, torch.Tensor):
+        pts = pts.to(clip_sims.device)
+    if not isinstance(clip_feats, torch.Tensor):
+        clip_feats = torch.as_tensor(clip_feats, device=pts.device)
+    elif clip_feats.device != pts.device:
+        clip_feats = clip_feats.to(pts.device)
+    if not isinstance(clip_sims, torch.Tensor):
+        clip_sims = torch.as_tensor(clip_sims, device=pts.device)
+    elif clip_sims.device != pts.device:
+        clip_sims = clip_sims.to(pts.device)
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
     sample_indices = torch.argsort(clip_sims, descending=True)[:sample_num]

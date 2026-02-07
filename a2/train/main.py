@@ -1,4 +1,5 @@
 import datetime
+import os
 import random
 import argparse
 import numpy as np
@@ -25,6 +26,7 @@ def main():
     parser.add_argument('--save_model_interval', type=int, default=500, metavar='N',
                         help='episode interval to save model')
     parser.add_argument('--log_suffix', action='store', type=str, default='bc')
+    parser.add_argument('--log_root', action='store', type=str, default='logs')
 
     # Transformer Paras
     parser.add_argument('--fusion_sa', dest='fusion_sa', action='store_true', default=False)
@@ -63,7 +65,12 @@ def main():
     args.task_num = 2 if args.task_emb else None
 
     # tensorboard setting
-    tb = SummaryWriter('tensorlogs/{}_BC_PP'.format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+    tb_dir = os.path.join(
+        os.path.abspath(args.log_root),
+        "tensorboard",
+        "{}_BC_PP".format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")),
+    )
+    tb = SummaryWriter(tb_dir)
 
     # resume logger
     if args.resume:
@@ -72,7 +79,7 @@ def main():
 
     # load logger
     resume_logger = resume_logger if args.resume else None
-    logger = Logger(suffix=args.log_suffix, resume_logger=resume_logger)
+    logger = Logger(suffix=args.log_suffix, resume_logger=resume_logger, log_root=args.log_root)
        
     # load unified agent
     if not args.adaptive:

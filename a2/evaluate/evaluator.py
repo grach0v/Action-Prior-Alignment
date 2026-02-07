@@ -17,6 +17,31 @@ from action_generator.place_generator import Placenet
 from models.bc_agent import ViLGP3D, AdaptViLGP3D, LangEmbViLGP3D
 from models.clip_agent import CLIPGrasp, CLIPPlace
 
+
+def _build_action_candidates(action_count, selected_idx, logits=None, max_candidates=1):
+    max_candidates = max(1, min(int(max_candidates), int(action_count)))
+    selected_idx = int(selected_idx)
+
+    ordered = []
+    if logits is not None:
+        score_vec = np.asarray(logits).reshape(-1)
+        ordered.extend(np.argsort(score_vec)[::-1].tolist())
+    ordered.append(selected_idx)
+    ordered.extend(range(action_count))
+
+    candidates = []
+    visited = set()
+    for idx in ordered:
+        idx = int(idx)
+        if idx < 0 or idx >= action_count or idx in visited:
+            continue
+        visited.add(idx)
+        candidates.append(idx)
+        if len(candidates) >= max_candidates:
+            break
+    return candidates
+
+
 class BaseEvaluator:
     def __init__(self, args):
         self.args = args
@@ -59,7 +84,8 @@ class BaseEvaluator:
         self.logger = Logger(
             case_dir=self.args.testing_case_dir,
             case=self.args.testing_case,
-            suffix=self.args.log_suffix
+            suffix=self.args.log_suffix,
+            log_root=self.args.log_root,
         )
         
     def init_networks(self):
@@ -210,6 +236,7 @@ class PickEvaluator(BaseEvaluator):
                 self.logger.save_visualizations(self.iteration, [sampled_pcd], suffix="sampled_pts")
             
             # Select action
+            logits_vec = None
             if len(grasp_pose_set) == 1:
                 action_idx = 0
             else:
@@ -229,6 +256,7 @@ class PickEvaluator(BaseEvaluator):
                                 logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, sampled_clip_sims, grasps)
                         else:
                             logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, grasps, lang_goal)
+                        logits_vec = logits[0]
 
                         z = 1e-4
                         gg.scores = (logits[0] - logits[0].min() + z) / (logits[0].max() - logits[0].min() + z)
@@ -247,18 +275,34 @@ class PickEvaluator(BaseEvaluator):
                             gg = gg[topk]
                             self.logger.save_visualizations(self.iteration, [pcd, *gg.to_open3d_geometry_list()], suffix="action")
 
-            # Execute action
-            action = grasp_pose_set[action_idx]
-            reward, done = self.env.step(action)
-            
-            # Update logs
-            self.iteration += 1
-            episode_steps += 1
-            episode_reward += reward
-            
-            # Log progress
-            print("\033[034m Episode: {}, step: {}, reward: {}\033[0m".format(episode, episode_steps, round(reward, 2)))
-            
+            max_grasp_candidates = min(len(grasp_pose_set), 5)
+            candidate_indices = _build_action_candidates(
+                action_count=len(grasp_pose_set),
+                selected_idx=action_idx,
+                logits=logits_vec,
+                max_candidates=max_grasp_candidates,
+            )
+
+            # Execute action with fallback candidates when a grasp attempt fails.
+            for attempt_id, candidate_idx in enumerate(candidate_indices, start=1):
+                action = grasp_pose_set[candidate_idx]
+                reward, done = self.env.step(action)
+
+                self.iteration += 1
+                episode_steps += 1
+                episode_reward += reward
+
+                print("\033[034m Episode: {}, step: {}, reward: {}\033[0m".format(episode, episode_steps, round(reward, 2)))
+
+                if done:
+                    break
+
+                if attempt_id < len(candidate_indices):
+                    print(f"\033[033m Grasp failed, trying fallback candidate {attempt_id + 1}/{len(candidate_indices)}\033[0m")
+
+                if episode_steps == self.args.max_episode_step:
+                    break
+
             if episode_steps == self.args.max_episode_step:
                 break
             
@@ -721,6 +765,7 @@ class PickPlaceEvaluator(BaseEvaluator):
                 sample_num=self.args.sample_num, 
                 visualize=self.args.visualize)
 
+            logits_vec = None
             if len(grasp_pose_set) == 1:
                 action_idx = 0
             else:
@@ -741,6 +786,7 @@ class PickPlaceEvaluator(BaseEvaluator):
                             logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, sampled_clip_sims, grasps)
                         else:
                             logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, grasps, grasp_lang_goal)
+                        logits_vec = logits[0]
 
                         num = np.max((logits.shape[1], 10))
                         topk = np.argsort(logits[0])[-num:]
@@ -755,32 +801,50 @@ class PickPlaceEvaluator(BaseEvaluator):
                             print("predicted logits of agent!!!")
                             frame = o3d.geometry.TriangleMesh.create_coordinate_frame(0.1)
                             o3d.visualization.draw_geometries([frame, pcd, *gg.to_open3d_geometry_list()])
-                            
-            action = grasp_pose_set[action_idx]
-            grasp_success, grasped_obj_id, pos_dist = self.env.grasp(action, follow_place=True)
-            if not grasp_success:
-                reward = -1
-            else:
-                if grasped_obj_id in self.env.target_obj_ids:
-                    reward = 2
-                    grasp_done = True
+
+            max_grasp_candidates = min(len(grasp_pose_set), 5)
+            candidate_indices = _build_action_candidates(
+                action_count=len(grasp_pose_set),
+                selected_idx=action_idx,
+                logits=logits_vec,
+                max_candidates=max_grasp_candidates,
+            )
+
+            for attempt_id, candidate_idx in enumerate(candidate_indices, start=1):
+                action = grasp_pose_set[candidate_idx]
+                grasp_success, grasped_obj_id, pos_dist = self.env.grasp(action, follow_place=True)
+                if not grasp_success:
+                    reward = -1
                 else:
-                    reward = 0
-                    
-            if grasped_obj_id not in self.env.target_obj_ids:
-                place_success = self.env.place_out_of_workspace()
+                    if grasped_obj_id in self.env.target_obj_ids:
+                        reward = 2
+                        grasp_done = True
+                    else:
+                        reward = 0
 
-            episode_steps += 1
-            self.iteration += 1
-            episode_reward += reward
-            print("\033[034m Episode stage of grasp: {}, total numsteps: {}, reward: {}\033[0m".format(episode, self.iteration, round(reward, 2)))
+                if grasp_success and grasped_obj_id not in self.env.target_obj_ids:
+                    place_success = self.env.place_out_of_workspace()
 
-            # record
-            self.logger.reward_logs.append(reward)
-            self.logger.executed_action_logs.append(action)
-            self.logger.write_to_log('reward', self.logger.reward_logs)
-            self.logger.write_to_log('executed_action', self.logger.executed_action_logs)
-            
+                episode_steps += 1
+                self.iteration += 1
+                episode_reward += reward
+                print("\033[034m Episode stage of grasp: {}, total numsteps: {}, reward: {}\033[0m".format(episode, self.iteration, round(reward, 2)))
+
+                # record
+                self.logger.reward_logs.append(reward)
+                self.logger.executed_action_logs.append(action)
+                self.logger.write_to_log('reward', self.logger.reward_logs)
+                self.logger.write_to_log('executed_action', self.logger.executed_action_logs)
+
+                if grasp_done:
+                    break
+
+                if attempt_id < len(candidate_indices):
+                    print(f"\033[033m Grasp failed, trying fallback candidate {attempt_id + 1}/{len(candidate_indices)}\033[0m")
+
+                if episode_steps == self.args.max_episode_step:
+                    break
+
             if grasp_done or episode_steps == self.args.max_episode_step:
                 break
 

@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument('--testing_case_dir', action='store', type=str, default='testing_cases/')
     parser.add_argument('--testing_case', action='store', type=str, default=None)
     parser.add_argument('--log_suffix', action='store', type=str, default=None)
+    parser.add_argument('--log_root', action='store', type=str, default='logs')
     parser.add_argument('--load_model', dest='load_model', action='store_true', default=False)
     parser.add_argument('--model_path', action='store', type=str, default='')
 
