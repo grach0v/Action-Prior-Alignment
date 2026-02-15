@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import json
 from env.constants import WORKSPACE_LIMITS, PIXEL_SIZE, IMAGE_SIZE, MIN_DIS, MAX_DIS, IN_REGION, OUT_REGION
 from utils.utils import generate_mask_map, generate_sector_mask
 from graspnetAPI import GraspGroup, Grasp
@@ -12,19 +14,23 @@ class Placenet:
     def place_generation_return_gt(self, depth, obj_centers, obj_sizes, ref_obj_centers, ref_regions, valid_place_mask=None, grasped_obj_size=None, \
                                     sample_num_each_object=5, workspace_limits=WORKSPACE_LIMITS, pixel_size=PIXEL_SIZE, topdown_place_rot=False, \
                                     action_variance=False):
+        debug_place_sampling = str(os.getenv("A2_DEBUG_PLACE_SAMPLING", "0")).lower() in {"1", "true", "yes", "on"}
         mask_map = generate_mask_map(obj_centers, obj_sizes)
         
         sample_inds = None
         # sample_num_each_object = 5
         valid_places_list = []
+        per_object_stats = []
         # uniformly generate pixels on the objects and near the objects
         for i in range(len(obj_centers)):                
             in_mask = generate_sector_mask((IMAGE_SIZE, IMAGE_SIZE), obj_centers[i], angle_range=[0, 359.99], \
                                             radius_min=0, radius_max=min(obj_sizes[i])//3) # 2
             in_mask_indices = np.argwhere(in_mask)
+            in_sampled = 0
             
             if in_mask_indices.shape[0] > 0:
                 min_sample_num_each_object = min(in_mask_indices.shape[0], sample_num_each_object)
+                in_sampled = int(min_sample_num_each_object)
                 if action_variance:
                     in_sample_indices = in_mask_indices[np.random.choice(in_mask_indices.shape[0], min_sample_num_each_object, replace=False)]
                 else:
@@ -50,9 +56,11 @@ class Placenet:
                 
             out_mask = out_mask * mask_map
             out_mask_indices = np.argwhere(out_mask)
+            out_sampled = 0
  
             if out_mask_indices.shape[0] > 0:
                 min_sample_num_each_object = min(out_mask_indices.shape[0], sample_num_each_object)    
+                out_sampled = int(min_sample_num_each_object)
                 if action_variance:           
                     out_sample_indices = out_mask_indices[np.random.choice(out_mask_indices.shape[0], min_sample_num_each_object, replace=False)]
                 else:
@@ -66,9 +74,35 @@ class Placenet:
                 if valid_place_mask is None:
                     if obj_centers[i] in ref_obj_centers and ref_regions[0] in OUT_REGION:
                         valid_places_list += list(range(sample_inds.shape[0] - min_sample_num_each_object, sample_inds.shape[0]))   
+
+            if debug_place_sampling:
+                per_object_stats.append(
+                    {
+                        "obj_idx": int(i),
+                        "center_rc": [int(obj_centers[i][0]), int(obj_centers[i][1])],
+                        "size_wh": [int(obj_sizes[i][0]), int(obj_sizes[i][1])],
+                        "in_mask_pixels": int(in_mask_indices.shape[0]),
+                        "out_mask_pixels": int(out_mask_indices.shape[0]),
+                        "in_sampled": in_sampled,
+                        "out_sampled": out_sampled,
+                    }
+                )
         
-        if valid_place_mask is not None:
+        if valid_place_mask is not None and sample_inds is not None:
             valid_places_list = list(np.where(valid_place_mask[sample_inds[:, 0], sample_inds[:, 1]])[0])
+        elif valid_place_mask is not None:
+            valid_places_list = []
+
+        if debug_place_sampling and sample_inds is None:
+            payload = {
+                "event": "sample_inds_none",
+                "num_obj_centers": len(obj_centers),
+                "num_ref_obj_centers": len(ref_obj_centers),
+                "valid_mask_nonzero": int(np.count_nonzero(valid_place_mask)) if valid_place_mask is not None else None,
+                "mask_map_nonzero": int(np.count_nonzero(mask_map)),
+                "per_object": per_object_stats,
+            }
+            print("[A2DBG_PLACE] " + json.dumps(payload), flush=True)
         
         if sample_inds is not None:
             sample_inds = sample_inds.transpose(1, 0)

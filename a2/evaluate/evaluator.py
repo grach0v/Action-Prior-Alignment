@@ -1,15 +1,17 @@
 import os
 import time
 import argparse
+import json
 import numpy as np
 import random
 import torch
 import shutil
 import open3d as o3d
 import matplotlib.pyplot as plt
+import cv2
 
 import utils.utils as utils
-from env.constants import WORKSPACE_LIMITS, GRASP_WORKSPACE_LIMITS, PLACE_WORKSPACE_LIMITS, PP_WORKSPACE_LIMITS, PP_PIXEL_SIZE, WORKSPACE_LIMITS, PP_SHIFT_Y
+from env.constants import WORKSPACE_LIMITS, GRASP_WORKSPACE_LIMITS, PLACE_WORKSPACE_LIMITS, PP_WORKSPACE_LIMITS, PP_PIXEL_SIZE, WORKSPACE_LIMITS, PP_SHIFT_Y, IN_REGION, OUT_REGION, MIN_DIS, MAX_DIS
 from helpers.logger import Logger
 from feature_extractor.feature_field_builder import FeatureField
 from action_generator.grasp_detetor import Graspnet
@@ -17,12 +19,124 @@ from action_generator.place_generator import Placenet
 from models.bc_agent import ViLGP3D, AdaptViLGP3D, LangEmbViLGP3D
 from models.clip_agent import CLIPGrasp, CLIPPlace
 
+
+def _parse_optional_int_env(name):
+    raw = os.getenv(name, "").strip()
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[WARN] Invalid integer for {name}={raw}, ignoring.")
+        return None
+
+
+def _parse_optional_float_env(name):
+    raw = os.getenv(name, "").strip()
+    if raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[WARN] Invalid float for {name}={raw}, ignoring.")
+        return None
+
+
+def _parse_bool_env(name, default=False):
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "":
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _json_default(value):
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    return str(value)
+
+
+def _save_place_debug_dump(
+    out_dir,
+    color_heightmap,
+    mask_heightmap,
+    valid_mask,
+    place_pixels,
+    valid_places_list,
+    selected_idx,
+    payload,
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    color = np.asarray(color_heightmap) if color_heightmap is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+    if color.ndim == 2:
+        color = np.stack([color] * 3, axis=-1)
+    if color.dtype != np.uint8:
+        color = np.clip(color, 0, 255).astype(np.uint8)
+    cv2.imwrite(os.path.join(out_dir, "color_heightmap.png"), cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
+
+    if mask_heightmap is not None:
+        mask = np.asarray(mask_heightmap)
+        if mask.dtype != np.uint8:
+            mask = np.clip(mask, 0, 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(out_dir, "mask_heightmap.png"), mask)
+
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask).astype(np.uint8) * 255
+        cv2.imwrite(os.path.join(out_dir, "valid_place_mask.png"), valid)
+
+    overlay = color.copy()
+    valid_set = set(int(i) for i in (valid_places_list or []))
+    num_candidates = 0
+    if isinstance(place_pixels, np.ndarray) and place_pixels.ndim == 2 and place_pixels.shape[0] == 2:
+        num_candidates = int(place_pixels.shape[1])
+        for idx in range(num_candidates):
+            row = int(place_pixels[0, idx])
+            col = int(place_pixels[1, idx])
+            if not (0 <= row < overlay.shape[0] and 0 <= col < overlay.shape[1]):
+                continue
+            if idx in valid_set:
+                color_bgr = (0, 255, 0)
+            else:
+                color_bgr = (0, 0, 255)
+            cv2.circle(overlay, (col, row), 2, color_bgr, thickness=-1)
+
+    if selected_idx is not None and num_candidates > 0 and 0 <= int(selected_idx) < num_candidates:
+        row = int(place_pixels[0, int(selected_idx)])
+        col = int(place_pixels[1, int(selected_idx)])
+        if 0 <= row < overlay.shape[0] and 0 <= col < overlay.shape[1]:
+            cv2.circle(overlay, (col, row), 4, (255, 255, 0), thickness=1)
+    cv2.imwrite(os.path.join(out_dir, "candidates_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+    with open(os.path.join(out_dir, "summary.json"), "w") as f:
+        json.dump(payload, f, indent=2, default=_json_default)
+
+
 class BaseEvaluator:
     def __init__(self, args):
         self.args = args
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.args.device = self.device
         self.args.task_num = 2 if self.args.task_emb else None
+        self.place_debug_dir = os.getenv("A2_PLACE_DEBUG_DIR", "").strip()
+        self.sample_num_grasp = _parse_optional_int_env("A2_SAMPLE_NUM_GRASP")
+        self.sample_num_place = _parse_optional_int_env("A2_SAMPLE_NUM_PLACE")
+        self.sample_num_place_in = _parse_optional_int_env("A2_SAMPLE_NUM_PLACE_IN")
+        self.sample_num_place_out = _parse_optional_int_env("A2_SAMPLE_NUM_PLACE_OUT")
+        self.relation_adaptive_place_sampling = _parse_bool_env("A2_PLACE_RELATION_ADAPTIVE", default=False)
+        # Keep valid-only selection enabled by default for now (oracle-ish eval mode).
+        # Set A2_PLACE_VALID_ONLY=0 (and A2_PP_PLACE_VALID_ONLY=0) to disable later.
+        self.place_valid_only = _parse_bool_env("A2_PLACE_VALID_ONLY", default=True)
+        self.place_relation_prior_weight = _parse_optional_float_env("A2_PLACE_RELATION_PRIOR_WEIGHT")
+        if self.place_relation_prior_weight is None:
+            self.place_relation_prior_weight = 35.0
+        self.default_sample_num = self.args.sample_num
+        self.place_samples_per_object = _parse_optional_int_env("A2_PLACE_SAMPLE_PER_OBJ")
+        if self.place_samples_per_object is None:
+            self.place_samples_per_object = 3
         
         # Set random seeds
         random.seed(self.args.seed)
@@ -46,6 +160,71 @@ class BaseEvaluator:
         # Initialize evaluation variables
         self.iteration = 0
         self.case = 0
+
+    def get_sample_num_grasp(self):
+        return self.sample_num_grasp if self.sample_num_grasp is not None else self.default_sample_num
+
+    def get_sample_num_place(self):
+        return self.sample_num_place if self.sample_num_place is not None else self.default_sample_num
+
+    def get_sample_num_place_for_relation(self, ref_regions):
+        default_num = self.get_sample_num_place()
+        if not self.relation_adaptive_place_sampling:
+            return default_num
+        if not ref_regions:
+            return default_num
+        relation = str(ref_regions[0]).strip().lower()
+        if relation in IN_REGION:
+            return self.sample_num_place_in if self.sample_num_place_in is not None else default_num
+        if relation in OUT_REGION:
+            return self.sample_num_place_out if self.sample_num_place_out is not None else default_num
+        return default_num
+
+    def apply_place_relation_prior(self, logits_np, place_pixels, ref_obj_centers, ref_obj_sizes, ref_regions, pixel_size):
+        if self.place_relation_prior_weight <= 0:
+            return logits_np
+        if logits_np is None or logits_np.size == 0:
+            return logits_np
+        if not isinstance(place_pixels, np.ndarray) or place_pixels.ndim != 2 or place_pixels.shape[0] != 2:
+            return logits_np
+        if not ref_obj_centers:
+            return logits_np
+
+        relation = str(ref_regions[0]).strip().lower() if ref_regions else ""
+        if relation not in IN_REGION and relation not in OUT_REGION:
+            return logits_np
+
+        cand_rc = place_pixels.T.astype(np.float32)  # [N, 2], [row, col]
+        ref_rc = np.asarray(ref_obj_centers, dtype=np.float32)  # [M, 2]
+        if ref_rc.ndim != 2 or ref_rc.shape[0] == 0:
+            return logits_np
+
+        dists = np.linalg.norm(cand_rc[:, None, :] - ref_rc[None, :, :], axis=2)
+        min_dists = np.min(dists, axis=1)
+
+        if ref_obj_sizes:
+            ref_sizes = np.asarray(ref_obj_sizes, dtype=np.float32)
+            if ref_sizes.ndim == 1:
+                ref_sizes = ref_sizes.reshape(1, -1)
+            max_ref_half = float(np.mean(np.max(ref_sizes, axis=1) / 2.0))
+            min_ref_half = float(np.mean(np.min(ref_sizes, axis=1) / 2.0))
+        else:
+            max_ref_half = 8.0
+            min_ref_half = 8.0
+
+        if relation in IN_REGION:
+            radius = max(min_ref_half, 1.0)
+            prior = 1.0 - np.clip(min_dists / radius, 0.0, 1.0)
+        else:
+            ring_min = max(float(MIN_DIS / pixel_size), max_ref_half)
+            ring_max = max(float(MAX_DIS / pixel_size), max_ref_half + 0.1)
+            ring_mid = 0.5 * (ring_min + ring_max)
+            ring_half = max(0.5 * (ring_max - ring_min), 1.0)
+            prior = 1.0 - np.clip(np.abs(min_dists - ring_mid) / ring_half, 0.0, 1.0)
+
+        prior = prior.astype(np.float32)
+        prior = prior - float(np.mean(prior))
+        return logits_np + float(self.place_relation_prior_weight) * prior
         
     def init_environment(self):
         if not self.args.unseen:
@@ -192,7 +371,7 @@ class PickEvaluator(BaseEvaluator):
                 pts,
                 feat_dict,
                 grasp_pose_set,
-                sample_num=self.args.sample_num,
+                sample_num=self.get_sample_num_grasp(),
                 sample_action=self.args.sample_grasp,
                 visualize=self.args.visualize
             )
@@ -419,10 +598,12 @@ class PlaceEvaluator(BaseEvaluator):
             # Get reference object information
             ref_obj_centers = []
             ref_regions = []
+            ref_obj_sizes = []
             for obj_id in self.env.reference_obj_ids:
                 if obj_id in bbox_ids:
                     bbox_idx = bbox_ids.index(obj_id)
                     ref_obj_centers.append(bbox_centers[bbox_idx])
+                    ref_obj_sizes.append(bbox_sizes[bbox_idx])
                     obj_idx = self.env.reference_obj_ids.index(obj_id)
                     ref_regions.append(self.env.reference_obj_dirs[obj_idx])
             
@@ -434,26 +615,67 @@ class PlaceEvaluator(BaseEvaluator):
                 ref_regions,
                 valid_place_mask=all_place_valid_mask,
                 grasped_obj_size=None,
-                sample_num_each_object=3,
+                sample_num_each_object=self.place_samples_per_object,
                 topdown_place_rot=self.args.topdown_place_rot,
                 action_variance=self.args.action_var
             )
+
+            debug_payload = {
+                "task": "place",
+                "split": "unseen" if self.args.unseen else "seen",
+                "case_file": os.path.basename(file_path),
+                "episode": int(episode),
+                "lang_goal": lang_goal,
+                "reference_obj_ids": list(self.env.reference_obj_ids),
+                "reference_obj_dirs": list(self.env.reference_obj_dirs),
+                "num_bbox": int(len(bbox_ids)),
+                "num_candidates": int(place_pixels.shape[1]) if isinstance(place_pixels, np.ndarray) else 0,
+                "num_valid_candidates": int(len(valid_places_list)),
+                "valid_mask_nonzero": int(np.count_nonzero(all_place_valid_mask)) if all_place_valid_mask is not None else 0,
+                "action_var": bool(self.args.action_var),
+                "sample_num_place": None,
+                "sample_num_each_object": int(self.place_samples_per_object),
+                "relation_adaptive_place_sampling": bool(self.relation_adaptive_place_sampling),
+                "place_valid_only": bool(self.place_valid_only),
+                "place_relation_prior_weight": float(self.place_relation_prior_weight),
+            }
             
             if len(valid_places_list) == 0:
                 print("\033[031m No valid places!\033[0m")
+                debug_payload["break_reason"] = "no_valid_places"
+                if self.place_debug_dir:
+                    dump_dir = os.path.join(
+                        self.place_debug_dir,
+                        f"place_{'unseen' if self.args.unseen else 'seen'}",
+                        os.path.splitext(os.path.basename(file_path))[0],
+                        f"episode_{episode:02d}",
+                    )
+                    _save_place_debug_dump(
+                        dump_dir,
+                        color_heightmap,
+                        mask_heightmap,
+                        all_place_valid_mask,
+                        place_pixels,
+                        valid_places_list,
+                        None,
+                        debug_payload,
+                    )
                 break
                 
             # Preprocess data
+            place_sample_num = self.get_sample_num_place_for_relation(ref_regions)
+            debug_payload["sample_num_place"] = None if place_sample_num is None else int(place_sample_num)
             sampled_pts, sampled_clip_feats, sampled_clip_sims, places, place_pose_set = utils.preprocess_pp_unified(
                 pts,
                 feat_dict,
                 place_pose_set,
-                sample_num=self.args.sample_num,
+                sample_num=place_sample_num,
                 sample_action=self.args.sample_place,
                 visualize=self.args.visualize
             )
             
             # Select action
+            logits_np = None
             if len(place_pose_set) == 1:
                 action_idx = 0
             else:
@@ -473,6 +695,19 @@ class PlaceEvaluator(BaseEvaluator):
                                 logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, sampled_clip_sims, places)
                         else:
                             logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, places, lang_goal)
+                        logits_np = np.asarray(logits[0]).astype(float)
+                        logits_np = self.apply_place_relation_prior(
+                            logits_np,
+                            place_pixels,
+                            ref_obj_centers,
+                            ref_obj_sizes,
+                            ref_regions,
+                            self.env.pixel_size,
+                        )
+                        action_idx = int(np.argmax(logits_np))
+                        if self.place_valid_only and len(valid_places_list) > 0 and action_idx not in valid_places_list:
+                            valid_idx = np.asarray(valid_places_list, dtype=np.int64)
+                            action_idx = int(valid_idx[np.argmax(logits_np[valid_idx])])
 
                         if self.args.visualize:
                             print("predicted logits of agent!!!")
@@ -498,11 +733,43 @@ class PlaceEvaluator(BaseEvaluator):
 
             # Execute action
             action = place_pose_set[action_idx]
-            if action_idx in valid_places_list:
+            selected_is_valid = action_idx in valid_places_list
+            if selected_is_valid:
                 done = True
                 reward = 1
             else:
                 reward = 0
+
+            debug_payload["selected_idx"] = int(action_idx)
+            debug_payload["selected_pose"] = np.asarray(action).tolist()
+            debug_payload["selected_is_valid"] = bool(selected_is_valid)
+            if logits_np is not None and logits_np.size > 0:
+                topk = np.argsort(logits_np)[-10:][::-1]
+                debug_payload["top10_logits"] = [
+                    {
+                        "idx": int(i),
+                        "logit": float(logits_np[i]),
+                        "is_valid": bool(int(i) in valid_places_list),
+                    }
+                    for i in topk
+                ]
+            if self.place_debug_dir:
+                dump_dir = os.path.join(
+                    self.place_debug_dir,
+                    f"place_{'unseen' if self.args.unseen else 'seen'}",
+                    os.path.splitext(os.path.basename(file_path))[0],
+                    f"episode_{episode:02d}",
+                )
+                _save_place_debug_dump(
+                    dump_dir,
+                    color_heightmap,
+                    mask_heightmap,
+                    all_place_valid_mask,
+                    place_pixels,
+                    valid_places_list,
+                    action_idx,
+                    debug_payload,
+                )
                 
             # Update logs
             self.iteration += 1
@@ -565,6 +832,16 @@ class PlaceEvaluator(BaseEvaluator):
 class PickPlaceEvaluator(BaseEvaluator):
     def __init__(self, args):
         super().__init__(args)
+        # Optional PP-specific override for valid-only place selection.
+        self.place_valid_only = _parse_bool_env("A2_PP_PLACE_VALID_ONLY", default=self.place_valid_only)
+        # Keep PP behavior tunable for focused A/B debugging without code edits.
+        self.pp_protect_ref_on_wrong_grasp = _parse_bool_env("A2_PP_PROTECT_REF_ON_WRONG_GRASP", default=True)
+        self.pp_legacy_place_obj_filter = _parse_bool_env("A2_PP_LEGACY_PLACE_OBJ_FILTER", default=False)
+        self.pp_drop_out_of_workspace_clutter = _parse_bool_env("A2_PP_DROP_OUT_OF_WORKSPACE_CLUTTER", default=False)
+        pp_ref_workspace_margin = _parse_optional_float_env("A2_PP_REF_WORKSPACE_MARGIN")
+        self.pp_ref_workspace_margin = 0.02 if pp_ref_workspace_margin is None else float(pp_ref_workspace_margin)
+        pp_target_workspace_margin = _parse_optional_float_env("A2_PP_TARGET_WORKSPACE_MARGIN")
+        self.pp_target_workspace_margin = 0.01 if pp_target_workspace_margin is None else float(pp_target_workspace_margin)
         
     def init_networks(self):
         self.graspnet = Graspnet()
@@ -612,6 +889,9 @@ class PickPlaceEvaluator(BaseEvaluator):
         reset_times = 0
         grasp_done = False
         place_done = False
+        grasped_obj_size_for_place = [5, 5]
+        workspace_margin = self.pp_ref_workspace_margin
+        target_workspace_margin = self.pp_target_workspace_margin
 
         # Reset environment
         while not reset:
@@ -620,28 +900,24 @@ class PickPlaceEvaluator(BaseEvaluator):
             reset, grasp_lang_goal, _ = self.env.add_object_push_from_pickplace_file(file_path, mode="grasp")
             print(f"\033[032m Reset environment of episode {episode}, grasp language goal {grasp_lang_goal}\033[0m")
 
-            # remove objects out of workspace for grasp 
-            out_of_workspace = []
-            for obj_id in self.env.obj_ids["rigid"]:
-                pos, _, _ = self.env.obj_info(obj_id)
-                if pos[0] < GRASP_WORKSPACE_LIMITS[0][0] or pos[0] > GRASP_WORKSPACE_LIMITS[0][1] \
-                    or pos[1] < GRASP_WORKSPACE_LIMITS[1][0] or pos[1] > GRASP_WORKSPACE_LIMITS[1][1]:
-                    print("\033[031m Delete objects out of workspace!\033[0m")
-                    self.env.remove_object_id(obj_id)    
+            # Optional legacy cleanup: dropping objects here can change body-id mapping
+            # between grasp/place stages, so keep it disabled by default.
+            if self.pp_drop_out_of_workspace_clutter:
+                for obj_id in list(self.env.obj_ids["rigid"]):
+                    pos, _, _ = self.env.obj_info(obj_id)
+                    if pos[0] < GRASP_WORKSPACE_LIMITS[0][0] - target_workspace_margin or pos[0] > GRASP_WORKSPACE_LIMITS[0][1] + target_workspace_margin \
+                        or pos[1] < GRASP_WORKSPACE_LIMITS[1][0] - target_workspace_margin or pos[1] > GRASP_WORKSPACE_LIMITS[1][1] + target_workspace_margin:
+                        if obj_id in self.env.target_obj_ids:
+                            continue
+                        print("\033[031m Delete objects out of workspace!\033[0m")
+                        self.env.remove_object_id(obj_id)
 
             # load place scenarios
             reset, _, place_lang_goal = self.env.add_object_push_from_pickplace_file(file_path, mode="place")
             print(f"\033[032m Reset environment of episode {episode}, place language goal {place_lang_goal}\033[0m")
 
-            # remove objects out of workspace for place 
-            out_of_workspace = []
-            for obj_id in self.env.obj_ids["rigid"]:
-                if obj_id >= 19:
-                    pos, _, _ = self.env.obj_info(obj_id)
-                    if pos[0] < PLACE_WORKSPACE_LIMITS[0][0] or pos[0] > PLACE_WORKSPACE_LIMITS[0][1] \
-                        or pos[1] < PLACE_WORKSPACE_LIMITS[1][0] or pos[1] > PLACE_WORKSPACE_LIMITS[1][1]:
-                        print("\033[031m Delete objects out of workspace!\033[0m")
-                        self.env.remove_object_id(obj_id)
+            # Do not prune place-stage objects at reset time; removing references here
+            # can make PP cases unsatisfiable before place starts.
 
             if not reset:
                 reset_times += 1
@@ -652,14 +928,17 @@ class PickPlaceEvaluator(BaseEvaluator):
             return
             
         while not grasp_done:
-            # check if one of the target objects is in the workspace:
+            # Keep target ids stable across retries; only check whether at least one target is
+            # currently reachable in the grasp workspace.
+            in_workspace_targets = []
             for obj_id in self.env.target_obj_ids:
                 pos, _, _ = self.env.obj_info(obj_id)
-                if pos[0] < GRASP_WORKSPACE_LIMITS[0][0] or pos[0] > GRASP_WORKSPACE_LIMITS[0][1] \
-                    or pos[1] < GRASP_WORKSPACE_LIMITS[1][0] or pos[1] > GRASP_WORKSPACE_LIMITS[1][1]:
-                    self.env.target_obj_ids.remove(obj_id)
-                    
-            if len(self.env.target_obj_ids) == 0:
+                if pos[0] < GRASP_WORKSPACE_LIMITS[0][0] - target_workspace_margin or pos[0] > GRASP_WORKSPACE_LIMITS[0][1] + target_workspace_margin \
+                    or pos[1] < GRASP_WORKSPACE_LIMITS[1][0] - target_workspace_margin or pos[1] > GRASP_WORKSPACE_LIMITS[1][1] + target_workspace_margin:
+                    continue
+                in_workspace_targets.append(obj_id)
+
+            if len(in_workspace_targets) == 0:
                 print("\033[031m Target objects are not in the scene!\033[0m")
                 break     
 
@@ -718,7 +997,7 @@ class PickPlaceEvaluator(BaseEvaluator):
                 feat_dict, 
                 grasp_pose_set, 
                 sample_action=self.args.sample_grasp, 
-                sample_num=self.args.sample_num, 
+                sample_num=self.get_sample_num_grasp(), 
                 visualize=self.args.visualize)
 
             if len(grasp_pose_set) == 1:
@@ -761,14 +1040,28 @@ class PickPlaceEvaluator(BaseEvaluator):
             if not grasp_success:
                 reward = -1
             else:
+                if grasped_obj_id in bbox_ids:
+                    grasped_obj_size_for_place = bbox_sizes[bbox_ids.index(grasped_obj_id)]
                 if grasped_obj_id in self.env.target_obj_ids:
                     reward = 2
                     grasp_done = True
                 else:
                     reward = 0
                     
-            if grasped_obj_id not in self.env.target_obj_ids:
-                place_success = self.env.place_out_of_workspace()
+            should_recover = False
+            if not grasp_success:
+                # Failed grasp should just reset robot state and retry another grasp.
+                # Sending the arm through trash-bin trajectory can perturb the scene.
+                self.env.open_gripper(is_slow=True)
+                _ = self.env.go_home()
+            elif grasped_obj_id not in self.env.target_obj_ids:
+                # Wrong-object grasp: optionally preserve reference objects.
+                if self.pp_protect_ref_on_wrong_grasp and grasped_obj_id in self.env.reference_obj_ids:
+                    should_recover = False
+                else:
+                    should_recover = True
+            if should_recover:
+                _ = self.env.place_out_of_workspace()
 
             episode_steps += 1
             self.iteration += 1
@@ -786,24 +1079,70 @@ class PickPlaceEvaluator(BaseEvaluator):
 
         if grasp_done:    
             while not place_done:
+                # Refresh observations after grasp to avoid using stale grasp-stage bboxes/point clouds.
+                self.env.bounds = PP_WORKSPACE_LIMITS
+                self.env.pixel_size = PP_PIXEL_SIZE
+                color_images, depth_images, pcd = utils.get_multi_view_images_w_pointcloud(
+                    self.env,
+                    visualize=self.args.visualize,
+                    single_view=self.args.single_view,
+                    diff_views=self.args.diff_views
+                )
+                place_pcd = utils.filter_pcd(pcd, PLACE_WORKSPACE_LIMITS, visualize=self.args.visualize)
+                color_heightmap, depth_heightmap, mask_heightmap = utils.get_true_heightmap(self.env)
+                bbox_ids, bbox_images, bbox_sizes, bbox_centers, bbox_positions = utils.get_true_bboxes(
+                    self.env, color_heightmap, depth_heightmap, mask_heightmap
+                )
+                bbox_ids, remain_bbox_images, bbox_sizes, bbox_centers, bbox_positions = utils.preprocess_bboxes(
+                    bbox_ids, bbox_images, bbox_sizes, bbox_centers, bbox_positions
+                )
+
                 # check if one of the target objects is in the workspace:
-                for obj_id in self.env.reference_obj_ids:
+                kept_ref_ids = []
+                kept_ref_dirs = []
+                for obj_id, obj_dir in zip(self.env.reference_obj_ids, self.env.reference_obj_dirs):
                     pos, _, _ = self.env.obj_info(obj_id)
-                    if pos[0] < PLACE_WORKSPACE_LIMITS[0][0] or pos[0] > PLACE_WORKSPACE_LIMITS[0][1] \
-                        or pos[1] < PLACE_WORKSPACE_LIMITS[1][0] or pos[1] > PLACE_WORKSPACE_LIMITS[1][1]:
-                        self.env.reference_obj_ids.remove(obj_id)
+                    if pos[0] < PLACE_WORKSPACE_LIMITS[0][0] - workspace_margin or pos[0] > PLACE_WORKSPACE_LIMITS[0][1] + workspace_margin \
+                        or pos[1] < PLACE_WORKSPACE_LIMITS[1][0] - workspace_margin or pos[1] > PLACE_WORKSPACE_LIMITS[1][1] + workspace_margin:
+                        continue
+                    kept_ref_ids.append(obj_id)
+                    kept_ref_dirs.append(obj_dir)
+                self.env.reference_obj_ids = kept_ref_ids
+                self.env.reference_obj_dirs = kept_ref_dirs
             
                 if len(self.env.reference_obj_ids) == 0:
-                    print("\033[031m Reference objects are not in the scene!\033[0m")
-                    break
+                    recovered_ref_ids = []
+                    recovered_ref_dirs = []
+                    fallback_label = None
+                    if hasattr(self.env, "reference_obj_labels") and len(self.env.reference_obj_labels) > 0:
+                        fallback_label = self.env.reference_obj_labels[0]
+                    fallback_dir = "near"
+                    if hasattr(self.env, "reference_obj_dirs") and len(self.env.reference_obj_dirs) > 0:
+                        fallback_dir = self.env.reference_obj_dirs[0]
+                    if fallback_label is not None:
+                        for obj_id, labels in self.env.obj_labels.items():
+                            if fallback_label in labels:
+                                pos, _, _ = self.env.obj_info(obj_id)
+                                if pos[0] < PLACE_WORKSPACE_LIMITS[0][0] - workspace_margin or pos[0] > PLACE_WORKSPACE_LIMITS[0][1] + workspace_margin \
+                                    or pos[1] < PLACE_WORKSPACE_LIMITS[1][0] - workspace_margin or pos[1] > PLACE_WORKSPACE_LIMITS[1][1] + workspace_margin:
+                                    continue
+                                recovered_ref_ids.append(obj_id)
+                                recovered_ref_dirs.append(fallback_dir)
+                    if len(recovered_ref_ids) == 0:
+                        print("\033[031m Reference objects are not in the scene!\033[0m")
+                        break
+                    self.env.reference_obj_ids = recovered_ref_ids
+                    self.env.reference_obj_dirs = recovered_ref_dirs
 
                 # get reference object information
                 ref_obj_centers = []
                 ref_regions = []
+                ref_obj_sizes = []
                 for obj_id in self.env.reference_obj_ids:
                     if obj_id in bbox_ids:
                         bbox_idx = bbox_ids.index(obj_id)
                         ref_obj_centers.append(bbox_centers[bbox_idx])
+                        ref_obj_sizes.append(bbox_sizes[bbox_idx])
                         obj_idx = self.env.reference_obj_ids.index(obj_id)
                         ref_regions.append(self.env.reference_obj_dirs[obj_idx])
                 
@@ -811,14 +1150,14 @@ class PickPlaceEvaluator(BaseEvaluator):
                 # bbox_ids, remain_bbox_images, bbox_sizes, bbox_centers, bbox_positions
                 place_bbox_sizes = []
                 place_bbox_centers = []
-                target_obj_size = [5, 5]
+                target_obj_size = list(grasped_obj_size_for_place)
+                place_obj_ids = set(self.env.obj_labels.keys())
                 for i in range(len(bbox_ids)):
                     obj_id = bbox_ids[i]
-                    if obj_id >= 19:
+                    use_for_place = (obj_id >= 19) if self.pp_legacy_place_obj_filter else (obj_id in place_obj_ids)
+                    if use_for_place:
                         place_bbox_sizes.append(bbox_sizes[i])
                         place_bbox_centers.append(bbox_centers[i])
-                    if obj_id == grasped_obj_id:
-                        target_obj_size = bbox_sizes[i]
                         
                 # placenet, generate all feasible places                 
                 all_place_valid_mask = utils.generate_all_place_dist(
@@ -842,14 +1181,57 @@ class PickPlaceEvaluator(BaseEvaluator):
                     ref_regions, 
                     valid_place_mask=all_place_valid_mask, 
                     grasped_obj_size=target_obj_size, 
-                    sample_num_each_object=3, 
+                    sample_num_each_object=self.place_samples_per_object, 
                     workspace_limits=PP_WORKSPACE_LIMITS, 
                     pixel_size=PP_PIXEL_SIZE, 
                     action_variance=self.args.action_var)
+
+                debug_payload = {
+                    "task": "pp_place",
+                    "split": "unseen" if self.args.unseen else "seen",
+                    "case_file": os.path.basename(file_path),
+                    "episode": int(episode),
+                    "grasp_lang_goal": grasp_lang_goal,
+                    "place_lang_goal": place_lang_goal,
+                    "grasped_obj_id": None if grasped_obj_id is None else int(grasped_obj_id),
+                    "reference_obj_ids": list(self.env.reference_obj_ids),
+                    "reference_obj_dirs": list(self.env.reference_obj_dirs),
+                    "num_bbox": int(len(bbox_ids)),
+                    "num_place_bbox": int(len(place_bbox_centers)),
+                    "num_candidates": int(place_pixels.shape[1]) if isinstance(place_pixels, np.ndarray) else 0,
+                    "num_valid_candidates": int(len(valid_places_list)),
+                    "valid_mask_nonzero": int(np.count_nonzero(all_place_valid_mask)) if all_place_valid_mask is not None else 0,
+                    "target_obj_size": list(target_obj_size),
+                    "action_var": bool(self.args.action_var),
+                    "sample_num_grasp": None if self.get_sample_num_grasp() is None else int(self.get_sample_num_grasp()),
+                    "sample_num_place": None,
+                    "sample_num_each_object": int(self.place_samples_per_object),
+                    "relation_adaptive_place_sampling": bool(self.relation_adaptive_place_sampling),
+                    "place_valid_only": bool(self.place_valid_only),
+                    "place_relation_prior_weight": float(self.place_relation_prior_weight),
+                }
                 
                 
                 if len(valid_places_list) == 0:
                     print("\033[031m Nonvalid place for this scene!\033[0m")
+                    debug_payload["break_reason"] = "nonvalid_place"
+                    if self.place_debug_dir:
+                        dump_dir = os.path.join(
+                            self.place_debug_dir,
+                            f"pp_place_{'unseen' if self.args.unseen else 'seen'}",
+                            os.path.splitext(os.path.basename(file_path))[0],
+                            f"episode_{episode:02d}",
+                        )
+                        _save_place_debug_dump(
+                            dump_dir,
+                            color_heightmap,
+                            mask_heightmap,
+                            all_place_valid_mask,
+                            place_pixels,
+                            valid_places_list,
+                            None,
+                            debug_payload,
+                        )
                     break
                 
                 place_pts = utils.generate_points_for_feature_extraction(place_pcd, cut_table=False, visualize=self.args.visualize)
@@ -868,15 +1250,18 @@ class PickPlaceEvaluator(BaseEvaluator):
                     visualize=self.args.visualize) 
                     
                 # preprocess
+                place_sample_num = self.get_sample_num_place_for_relation(ref_regions)
+                debug_payload["sample_num_place"] = None if place_sample_num is None else int(place_sample_num)
                 sampled_pts, sampled_clip_feats, sampled_clip_sims, places, place_pose_set = utils.preprocess_pp_unified(
                     place_pts, 
                     feat_dict, 
                     place_pose_set, 
-                    sample_num=self.args.sample_num, 
+                    sample_num=place_sample_num, 
                     sample_action=self.args.sample_place, 
                     visualize=self.args.visualize)
                 
 
+                logits_np = None
                 if len(place_pose_set) == 1:
                     action_idx = 0
                 else:
@@ -897,6 +1282,19 @@ class PickPlaceEvaluator(BaseEvaluator):
                                 logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, sampled_clip_sims, places)
                             else:
                                 logits, action_idx = self.agent.select_action(sampled_pts, sampled_clip_feats, places, place_lang_goal)
+                            logits_np = np.asarray(logits[0]).astype(float)
+                            logits_np = self.apply_place_relation_prior(
+                                logits_np,
+                                place_pixels,
+                                ref_obj_centers,
+                                ref_obj_sizes,
+                                ref_regions,
+                                PP_PIXEL_SIZE,
+                            )
+                            action_idx = int(np.argmax(logits_np))
+                            if self.place_valid_only and len(valid_places_list) > 0 and action_idx not in valid_places_list:
+                                valid_idx = np.asarray(valid_places_list, dtype=np.int64)
+                                action_idx = int(valid_idx[np.argmax(logits_np[valid_idx])])
 
                             num = np.max((logits.shape[1], 1))
                             topk = np.argsort(logits[0])[-num:]
@@ -912,11 +1310,42 @@ class PickPlaceEvaluator(BaseEvaluator):
                                 o3d.visualization.draw_geometries([frame, place_pcd, *pp.to_open3d_geometry_list()])
 
                 action = place_pose_set[action_idx]
-                if action_idx in valid_places_list:
+                selected_is_valid = action_idx in valid_places_list
+                if selected_is_valid:
                     place_done = True
                     reward = 2
                 else:
                     reward = 0
+                debug_payload["selected_idx"] = int(action_idx)
+                debug_payload["selected_pose"] = np.asarray(action).tolist()
+                debug_payload["selected_is_valid"] = bool(selected_is_valid)
+                if logits_np is not None and logits_np.size > 0:
+                    topk = np.argsort(logits_np)[-10:][::-1]
+                    debug_payload["top10_logits"] = [
+                        {
+                            "idx": int(i),
+                            "logit": float(logits_np[i]),
+                            "is_valid": bool(int(i) in valid_places_list),
+                        }
+                        for i in topk
+                    ]
+                if self.place_debug_dir:
+                    dump_dir = os.path.join(
+                        self.place_debug_dir,
+                        f"pp_place_{'unseen' if self.args.unseen else 'seen'}",
+                        os.path.splitext(os.path.basename(file_path))[0],
+                        f"episode_{episode:02d}",
+                    )
+                    _save_place_debug_dump(
+                        dump_dir,
+                        color_heightmap,
+                        mask_heightmap,
+                        all_place_valid_mask,
+                        place_pixels,
+                        valid_places_list,
+                        action_idx,
+                        debug_payload,
+                    )
                 # episode_steps += 1
                 self.iteration += 1
                 episode_reward += reward

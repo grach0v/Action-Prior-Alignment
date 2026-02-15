@@ -49,8 +49,9 @@ class CLIPGrasp(object):
 
         k = int(0.05 * M)
         # 构建 KD-Tree 计算最近邻
-        nbrs = NearestNeighbors(n_neighbors=k, algorithm='kd_tree').fit(pts[0])
-        distances, indices = nbrs.kneighbors(pts[0])
+        pts_np = pts[0].detach().cpu().numpy()
+        nbrs = NearestNeighbors(n_neighbors=k, algorithm='kd_tree').fit(pts_np)
+        distances, indices = nbrs.kneighbors(pts_np)
         clip_sims_ = clip_sims[0].cpu().numpy()
         average_affordances = np.array([clip_sims_[idx].mean() for idx in indices])
         max_avg_affordance = average_affordances.max()
@@ -111,8 +112,9 @@ class CLIPPlace(object):
             dist_map = torch.norm((pos_pts - pos_grasps), dim=2)
 
         k = int(0.05 * M)
-        nbrs = NearestNeighbors(n_neighbors=k, algorithm='kd_tree').fit(pts[0])
-        distances, indices = nbrs.kneighbors(pts[0])
+        pts_np = pts[0].detach().cpu().numpy()
+        nbrs = NearestNeighbors(n_neighbors=k, algorithm='kd_tree').fit(pts_np)
+        distances, indices = nbrs.kneighbors(pts_np)
         clip_sims_ = clip_sims[0].cpu().numpy()
         average_affordances = np.array([clip_sims_[idx].mean() for idx in indices])
         max_avg_affordance = average_affordances.max()

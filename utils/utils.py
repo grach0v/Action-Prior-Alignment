@@ -665,6 +665,8 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
     pts = torch.from_numpy(pts)
     clip_feats = feat_dict['clip_feats']
     clip_sims = feat_dict['clip_sims'][..., 0]
+    device = clip_feats.device if isinstance(clip_feats, torch.Tensor) else torch.device("cpu")
+    pts = pts.to(device=device)
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
     sample_indices = torch.argsort(clip_sims, descending=True)[:sample_num]
@@ -704,7 +706,7 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
             grasps = grasp
         else:
             grasps = torch.cat((grasps, grasp), dim=0) # shape = [n_grasp, grasp_dim]
-    grasps = grasps.unsqueeze(0).to(dtype=torch.float32) # shape = [1, n_grasp, grasp_dim]
+    grasps = grasps.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, n_grasp, grasp_dim]
 
     if sample_grasp:
         pos_grasps = grasps[..., :3][0].unsqueeze(1)
@@ -722,7 +724,7 @@ def preprocess_pp(pts, feat_dict, grasp_pose_set, place_pose_set, sample_num, sa
             places = place
         else:
             places = torch.cat((places, place), dim=0) # shape = [n_place, place_dim]
-    places = places.unsqueeze(0).to(dtype=torch.float32) # shape = [1, n_place, place_dim]
+    places = places.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, n_place, place_dim]
     
     if sample_place:
         pos_places = places[..., :3][0].unsqueeze(1)
@@ -738,6 +740,8 @@ def preprocess_pp_unified(pts, feat_dict, action_set, sample_num, sample_action=
     pts = torch.from_numpy(pts)
     clip_feats = feat_dict['clip_feats']
     clip_sims = feat_dict['clip_sims'][..., 0]
+    device = clip_feats.device if isinstance(clip_feats, torch.Tensor) else torch.device("cpu")
+    pts = pts.to(device=device)
 
     # !!! sample top 50%(8 objs)/25%(15 objs) points !!!
     sample_indices = torch.argsort(clip_sims, descending=True)[:sample_num]
@@ -781,14 +785,14 @@ def preprocess_pp_unified(pts, feat_dict, action_set, sample_num, sample_action=
             actions = action
         else:
             actions = torch.cat((actions, action), dim=0) # shape = [n_grasp, grasp_dim]
-    actions = actions.unsqueeze(0).to(dtype=torch.float32) # shape = [1, n_grasp, grasp_dim]
+    actions = actions.unsqueeze(0).to(device=device, dtype=torch.float32) # shape = [1, n_grasp, grasp_dim]
 
     if sample_action:
         pos_actions = actions[..., :3][0].unsqueeze(1)
         dist_map = torch.norm(pos_actions - sampled_pts, dim=-1)
         min_dist = torch.min(dist_map, dim=1)[0]
         sampled_indices = torch.where(min_dist < 0.05)[0]
-        action = actions[:, sampled_indices, :]
+        actions = actions[:, sampled_indices, :]
         action_set = list(np.array(action_set)[sampled_indices.cpu().numpy()])
         
     return sampled_pts, sampled_clip_feats, sampled_clip_sims, actions, action_set

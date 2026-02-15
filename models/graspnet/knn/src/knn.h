@@ -1,10 +1,9 @@
 #pragma once
 #include "cpu/vision.h"
+#include <c10/cuda/CUDAStream.h>
 
 #ifdef WITH_CUDA
 #include "cuda/vision.h"
-#include <THC/THC.h>
-extern THCState *state;
 #endif
 
 
@@ -20,17 +19,19 @@ int knn(at::Tensor& ref, at::Tensor& query, at::Tensor& idx)
     ref_nb = ref.size(2);
     query_nb = query.size(2);
 
-    float *ref_dev = ref.data<float>();
-    float *query_dev = query.data<float>();
-    long *idx_dev = idx.data<long>();
+    float *ref_dev = ref.data_ptr<float>();
+    float *query_dev = query.data_ptr<float>();
+    long *idx_dev = idx.data_ptr<long>();
 
 
 
 
-  if (ref.type().is_cuda()) {
+  if (ref.is_cuda()) {
 #ifdef WITH_CUDA
     // TODO raise error if not compiled with CUDA
-    float *dist_dev = (float*)THCudaMalloc(state, ref_nb * query_nb * sizeof(float));
+    float *dist_dev = nullptr;
+    auto alloc_status = cudaMalloc((void **)&dist_dev, ref_nb * query_nb * sizeof(float));
+    TORCH_CHECK(alloc_status == cudaSuccess, "knn cudaMalloc failed: ", cudaGetErrorString(alloc_status));
 
     for (int b = 0; b < batch; b++)
     {
@@ -39,16 +40,13 @@ int knn(at::Tensor& ref, at::Tensor& query, at::Tensor& idx)
       knn_device(ref_dev + b * dim * ref_nb, ref_nb, query_dev + b * dim * query_nb, query_nb, dim, k,
       dist_dev, idx_dev + b * k * query_nb, c10::cuda::getCurrentCUDAStream());
     }
-    THCudaFree(state, dist_dev);
+    auto free_status = cudaFree(dist_dev);
+    TORCH_CHECK(free_status == cudaSuccess, "knn cudaFree failed: ", cudaGetErrorString(free_status));
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        printf("error in knn: %s\n", cudaGetErrorString(err));
-        THError("aborting");
-    }
+    TORCH_CHECK(err == cudaSuccess, "error in knn: ", cudaGetErrorString(err));
     return 1;
 #else
-    AT_ERROR("Not compiled with GPU support");
+    TORCH_CHECK(false, "Not compiled with GPU support");
 #endif
   }
 

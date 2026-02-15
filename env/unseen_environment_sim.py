@@ -13,6 +13,45 @@ import utils.utils as utils
 import env.cameras as cameras
 from env.constants import PIXEL_SIZE, WORKSPACE_LIMITS, LANG_TEMPLATES, UNSEEN_LABEL, UNSEEN_GENERAL_LABEL, UNSEEN_COLOR_SHAPE, UNSEEN_FUNCTION, UNSEEN_LABEL_DIR_MAP, UNSEEN_KEYWORD_DIR_MAP, UNSEEN_KEYWORD_DIR_MAP_PLACE
 
+ASSET_ROOT = os.environ.get("A2_ASSETS_ROOT", "assets").rstrip("/")
+DEFAULT_ASSET_ROOT = "assets"
+
+
+def _asset_path(rel_path):
+    candidate = os.path.join(ASSET_ROOT, rel_path)
+    if os.path.exists(candidate):
+        return candidate.replace("\\", "/")
+    return os.path.join(DEFAULT_ASSET_ROOT, rel_path).replace("\\", "/")
+
+
+def _resolve_case_obj_file(obj_file):
+    if obj_file.startswith("assets/"):
+        rel_path = obj_file[len("assets/"):]
+        candidate = os.path.join(ASSET_ROOT, rel_path)
+        if os.path.exists(candidate):
+            return candidate.replace("\\", "/")
+        return os.path.join(DEFAULT_ASSET_ROOT, rel_path).replace("\\", "/")
+    return obj_file
+
+
+def _normalize_unseen_case_obj_file(obj_file):
+    # Some case files use "sugar_*" while assets are named "suger_*".
+    normalized = (
+        obj_file
+        .replace("assets/unseen_objects/sugar_1.urdf", "assets/unseen_objects/suger_1.urdf")
+        .replace("assets/unseen_objects/sugar_2.urdf", "assets/unseen_objects/suger_2.urdf")
+        .replace("/sugar_1.urdf", "/suger_1.urdf")
+        .replace("/sugar_2.urdf", "/suger_2.urdf")
+    )
+    return _resolve_case_obj_file(normalized)
+
+
+def _normalize_unseen_target_label(label):
+    clean = label.strip()
+    if clean in {"suger", "suger_1", "suger_2"}:
+        return "sugar"
+    return clean
+
 class Environment:
     def __init__(self, gui=True, time_step=1 / 240):
         """Creates environment with PyBullet.
@@ -234,11 +273,11 @@ class Environment:
         )
         if workspace == "raw":
             self.workspace = pb.loadURDF(
-                "assets/workspace/workspace.urdf", basePosition=(0.5, 0, 0), useFixedBase=True,
+                _asset_path("workspace/workspace.urdf"), basePosition=(0.5, 0, 0), useFixedBase=True,
             )
         elif workspace == "extend":
             self.workspace = pb.loadURDF(
-                "assets/workspace/pp_workspace.urdf", basePosition=(0.5, 0, 0), useFixedBase=True,
+                _asset_path("workspace/pp_workspace.urdf"), basePosition=(0.5, 0, 0), useFixedBase=True,
             )
         pb.changeDynamics(
             self.plane,
@@ -259,7 +298,7 @@ class Environment:
 
         # Load UR5e
         self.ur5e = pb.loadURDF(
-            "assets/ur5e/ur5e.urdf", basePosition=(0, 0, 0), useFixedBase=True,
+            _asset_path("ur5e/ur5e.urdf"), basePosition=(0, 0, 0), useFixedBase=True,
         )
         self.ur5e_joints = []
         for i in range(pb.getNumJoints(self.ur5e)):
@@ -294,7 +333,7 @@ class Environment:
         """Load end-effector: gripper"""
         ee_position, _ = self.get_link_pose(self.ur5e, self.ur5e_ee_id)
         self.ee = pb.loadURDF(
-            "assets/ur5e/gripper/robotiq_2f_85.urdf",
+            _asset_path("ur5e/gripper/robotiq_2f_85.urdf"),
             ee_position,
             pb.getQuaternionFromEuler((0, -np.pi / 2, 0)),
         )
@@ -414,6 +453,7 @@ class Environment:
             obs, done
         """
         done = False
+        reward = 0.0
         if pose is not None:
             success, grasped_obj_id, pos_dist = self.grasp(pose)
             # !!! Note that here we do not punish the failed grasp, just encourage to execute the nearest grasp to the targets
@@ -422,7 +462,7 @@ class Environment:
                 done = True
             else:
                 max_pos_dist = np.sqrt((self.bounds[0][1]-self.bounds[0][0]) ** 2 + (self.bounds[1][1]-self.bounds[1][0]) ** 2)
-                reward = - pos_dist / max_pos_dist
+                reward = -1.0 if pos_dist is None else (-pos_dist / max_pos_dist)
 
         # Step simulator asynchronously until objects settle.
         while not self.is_static:
@@ -488,7 +528,12 @@ class Environment:
         return color, depth, segm
 
     def __del__(self):
-        pb.disconnect()
+        try:
+            client_id = getattr(self, "_client_id", None)
+            if client_id is not None and hasattr(pb, "isConnected") and pb.isConnected(client_id):
+                pb.disconnect(client_id)
+        except Exception:
+            pass
 
     def get_link_pose(self, body, link):
         result = pb.getLinkState(body, link)
@@ -497,15 +542,15 @@ class Environment:
     def add_objects(self, num_obj, workspace_limits, test_data=False):
         """Randomly dropped objects to the workspace"""
         self.num_obj = num_obj
-        mesh_list = glob.glob("assets/unseen_objects/*.urdf")
+        mesh_list = glob.glob(_asset_path("unseen_objects/*.urdf"))
 
         # get target object
         target_mesh_list = []
         for target_obj in self.target_obj_lst:
-            target_mesh_file = "assets/unseen_objects/" + target_obj + ".urdf"
+            target_mesh_file = _asset_path("unseen_objects/" + target_obj + ".urdf")
             target_mesh_list.append(target_mesh_file)
         for obj in self.target_obj_dir:
-            obj_mesh_file = "assets/unseen_objects/" + obj + ".urdf"
+            obj_mesh_file = _asset_path("unseen_objects/" + obj + ".urdf")
             mesh_list.remove(obj_mesh_file)
 
         obj_mesh_ind = np.random.randint(0, len(mesh_list), size=num_obj-len(self.target_obj_lst))
@@ -613,7 +658,7 @@ class Environment:
     def add_objects_for_place(self, num_obj, workspace_limits, test_data=False):
         """Randomly dropped objects to the workspace"""
         self.num_obj = num_obj
-        mesh_list = glob.glob("assets/unseen_objects/*.urdf")
+        mesh_list = glob.glob(_asset_path("unseen_objects/*.urdf"))
 
         obj_mesh_ind = np.random.randint(0, len(mesh_list), size=num_obj)
 
@@ -691,6 +736,7 @@ class Environment:
         return body_ids, True
 
     def add_objects_w_target_pose(self, obj_mesh_file, workspace_limits):
+        obj_mesh_file = _normalize_unseen_case_obj_file(obj_mesh_file)
 
         body_ids = []
     
@@ -750,7 +796,7 @@ class Environment:
             obj_orientations = []
             for object_idx in range(num_obj):
                 file_content_curr_object = file_content[object_idx+2].split()
-                obj_file = file_content_curr_object[0]
+                obj_file = _normalize_unseen_case_obj_file(file_content_curr_object[0])
                 obj_files.append(obj_file)
                 obj_positions.append(
                     [
@@ -802,7 +848,7 @@ class Environment:
         with open(file_name, "r") as preset_file:
             file_content = preset_file.readlines()
             self.lang_goal = file_content[0].split('\n')[0]
-            target_obj_label = file_content[1].split('\n')[0]
+            target_obj_label = _normalize_unseen_target_label(file_content[1].split('\n')[0])
             target_dir = file_content[2].split('\n')[0]
             num_obj = len(file_content) - 3
             obj_files = []
@@ -810,7 +856,7 @@ class Environment:
             obj_orientations = []
             for object_idx in range(num_obj):
                 file_content_curr_object = file_content[object_idx+3].split()
-                obj_file = file_content_curr_object[0]
+                obj_file = _normalize_unseen_case_obj_file(file_content_curr_object[0])
                 obj_files.append(obj_file)
                 if not variance:
                     obj_positions.append(
@@ -914,7 +960,7 @@ class Environment:
                 obj_orientations = []
                 for object_idx in range(grasp_num_obj):
                     file_content_curr_object = file_content[object_idx + 2].split()
-                    obj_file = file_content_curr_object[0]
+                    obj_file = _normalize_unseen_case_obj_file(file_content_curr_object[0])
                     obj_files.append(obj_file)
                     obj_positions.append(
                         [
@@ -964,7 +1010,7 @@ class Environment:
             with open(file_name, "r") as preset_file:
                 file_content = preset_file.readlines()
                 place_lang_goal = file_content[17].split('\n')[0]
-                target_obj_label = file_content[18].split('\n')[0]
+                target_obj_label = _normalize_unseen_target_label(file_content[18].split('\n')[0])
                 target_dir = file_content[19].split('\n')[0]
                 place_num_obj = 8
                 obj_files = []
@@ -972,7 +1018,7 @@ class Environment:
                 obj_orientations = []
                 for object_idx in range(place_num_obj):
                     file_content_curr_object = file_content[object_idx + 20].split()
-                    obj_file = file_content_curr_object[0]
+                    obj_file = _normalize_unseen_case_obj_file(file_content_curr_object[0])
                     obj_files.append(obj_file)
                     obj_positions.append(
                         [
@@ -1089,6 +1135,12 @@ class Environment:
 
     def move_joints(self, target_joints, speed=0.01, timeout=3):
         """Move UR5e to target joint configuration."""
+        env_timeout = os.getenv("A2_MOVE_JOINTS_TIMEOUT", "").strip()
+        if env_timeout:
+            try:
+                timeout = float(env_timeout)
+            except ValueError:
+                pass
         t0 = time.time()
         while (time.time() - t0) < timeout:
             current_joints = np.array(
@@ -1295,7 +1347,8 @@ class Environment:
                 for target_obj_id in self.target_obj_ids:
                     pos_dist = np.linalg.norm(np.array(self.info[grasped_obj_id][0]) - np.array(self.info[target_obj_id][0]))
                     pos_dists.append(pos_dist)
-                min_pos_dist = min(pos_dists)
+                if len(pos_dists) > 0:
+                    min_pos_dist = min(pos_dists)
 
         if not follow_place:
             if success:
